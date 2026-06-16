@@ -1,0 +1,26 @@
+# 环境变量文件（包含敏感信息）
+.env
+# .paicli/ 整目录忽略（含真实 key 的 config.json / mcp.json），但放行不含 key 的示例模板和 PAI.md
+.paicli/*
+!.paicli/config.example.json
+!.paicli/
+!.paicli/PAI.md
+PAI.local.md
+
+# 编译输出
+target/
+*.class
+
+# IDE
+.idea/
+*.iml
+.vscode/
+
+# 日志
+*.log
+
+# 操作系统
+.DS_Store
+Thumbs.db
+# 作者最终版参考副本（对比用，不入库）
+paicli-main/

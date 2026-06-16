@@ -1,0 +1,106 @@
+{
+  "_help": {
+    "说明": "PaiCLI 模型配置示例。复制本文件为 .paicli/config.json 并填入真实 key（含 key 的 config.json 已被 .gitignore 忽略，不会提交）。JSON 不支持注释，本 _help 段仅作文档，程序会忽略。",
+    "结构": "两层：platforms（平台层，共享 key/baseUrl/series）+ models（模型层，引用平台 + 各自的 model/displayName）。同平台多模型不必重复填 key。",
+    "顶层字段": {
+      "defaultProvider": "启动默认加载的模型，填 models 里的某个条目名（切换名）",
+      "reviewerProvider": "可选。Multi-Agent(/team) 模式 Reviewer 用哪个模型；填 models 条目名；不填则 Reviewer 复用 Worker 同款模型"
+    },
+    "platform字段": {
+      "apiKey": "必填。该平台所有模型共用的 key",
+      "baseUrl": "必填。OpenAI 兼容 endpoint 根（自动补 /chat/completions）",
+      "series": "决定用哪套差异：glm/deepseek/step/kimi/qwen 走对应内置钩子；openai = 通用无特殊；不填默认按平台名",
+      "maxContextWindow": "可选。该平台默认上下文窗口；模型层可覆盖"
+    },
+    "model字段": {
+      "platform": "必填。引用上面某个 platform 名",
+      "model": "必填。发给 API 的真实 model id（如 glm-4.7 / deepseek-ai/DeepSeek-V4-Pro）",
+      "displayName": "可选。/model 列表和横幅显示的友好型号名；不填则显示 model id",
+      "maxTokens": "可选。单次回复最大输出 token；不填走平台默认（部分平台默认很小会截断输出）",
+      "temperature": "可选。采样温度 0~2，默认 0.7；不想发就设负数",
+      "maxContextWindow": "可选。覆盖平台/series 默认窗口；驱动上下文压缩阈值，不确定就别填",
+      "extraParams": "可选。平台特有参数原样透传进请求体，如 enable_thinking / reasoning_effort / top_p / enable_search",
+      "fallback": "可选。故障转移：主调用失败(吐字前)时按序切到这些 model 条目名(应是同版本不同平台)"
+    },
+    "series可选值": "glm | deepseek | step | kimi | qwen（内置钩子）| openai（通用，任意 OpenAI 兼容平台）"
+  },
+
+  "defaultProvider": "qwen36",
+  "reviewerProvider": "glm47",
+
+  "platforms": {
+    "xfyun": {
+      "apiKey": "讯飞 MaaS 平台 key",
+      "baseUrl": "https://maas-api.cn-huabei-1.xf-yun.com/v2",
+      "series": "qwen"
+    },
+    "zhipu": {
+      "apiKey": "智谱 token key",
+      "baseUrl": "https://open.bigmodel.cn/api/paas/v4",
+      "series": "openai"
+    },
+    "modelscope": {
+      "apiKey": "魔搭 ModelScope Access Token",
+      "baseUrl": "https://api-inference.modelscope.cn/v1",
+      "series": "openai"
+    },
+    "nvidia": {
+      "apiKey": "NVIDIA NIM API key",
+      "baseUrl": "https://integrate.api.nvidia.com/v1",
+      "series": "openai"
+    },
+    "local-vllm": {
+      "apiKey": "dummy",
+      "baseUrl": "http://localhost:8000/v1",
+      "series": "openai",
+      "maxContextWindow": 131072
+    }
+  },
+
+  "models": {
+    "qwen36": {
+      "platform": "xfyun",
+      "model": "xopqwen36v35b",
+      "displayName": "Qwen3.6-35B-A3B"
+    },
+
+    "qwen35-full": {
+      "platform": "xfyun",
+      "model": "xopqwen35v35b",
+      "displayName": "Qwen3.5-35B-A3B",
+      "maxTokens": 8192,
+      "temperature": 0.7,
+      "maxContextWindow": 128000,
+      "extraParams": {
+        "enable_thinking": true,
+        "top_p": 0.9
+      }
+    },
+
+    "glm47": {
+      "platform": "zhipu",
+      "model": "glm-4.7",
+      "displayName": "GLM-4.7",
+      "maxTokens": 131072
+    },
+
+    "ds-v4": {
+      "platform": "modelscope",
+      "model": "deepseek-ai/DeepSeek-V4-Pro",
+      "displayName": "DeepSeek-V4-Pro",
+      "fallback": ["ds-v4-nv"]
+    },
+
+    "ds-v4-nv": {
+      "platform": "nvidia",
+      "model": "deepseek-ai/deepseek-v4-pro",
+      "displayName": "DeepSeek-V4-Pro (NVIDIA备)"
+    },
+
+    "my-local": {
+      "platform": "local-vllm",
+      "model": "Qwen/Qwen3-235B",
+      "displayName": "本地 Qwen3-235B"
+    }
+  }
+}
