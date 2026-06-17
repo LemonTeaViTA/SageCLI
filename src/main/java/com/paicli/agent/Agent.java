@@ -69,7 +69,7 @@ public class Agent {
         this.toolRegistry.setContextProfile(memoryManager.getContextProfile());
         this.memoryManager.setProjectPath(this.toolRegistry.getProjectPath());
         this.toolRegistry.setScopedMemorySaver(memoryManager::storeFact);
-        conversationHistory.add(LlmClient.Message.system(buildSystemPrompt("")));
+        conversationHistory.add(LlmClient.Message.system(buildSystemPrompt()));
     }
 
     public void setLlmClient(LlmClient llmClient) {
@@ -167,13 +167,18 @@ public class Agent {
         memoryManager.addUserMessage(userInput);
         storeExplicitBrowserMemoryHint(userInput);
 
-        // 检索相关长期记忆，注入到 system prompt
+        // 检索相关长期记忆（基于本轮 user 输入）。注意：注入到本轮 user 消息而非 system prompt——
+        // memoryContext 每轮随 query 变化，若塞进 system prompt 会让 conversationHistory[0] 每轮变，
+        // 破坏平台 prefix cache 命中。放到 user 消息既不破坏前缀稳定，语义上也更自然。
         ContextProfile contextProfile = memoryManager.getContextProfile();
         String memoryContext = memoryManager.buildContextForQuery(userInput, contextProfile.memoryContextTokens());
-        updateSystemPromptWithMemory(memoryContext);
 
-        // 添加用户输入到历史（如有 skill body 注入，前置到原文之前）
-        String userMessageContent = prependSkillBodies(userInput);
+        // 刷新 system prompt（不含每轮变化的 memoryContext）：仅当 skill 索引 / 外部资源 / 项目记忆
+        // 真正变化时内容才变，否则跨轮字节一致，平台 prefix cache 可命中 system + 工具定义这一大段。
+        refreshSystemPrompt();
+
+        // 组装本轮 user 消息：相关长期记忆 + skill body + 原始输入
+        String userMessageContent = prependMemoryAndSkills(memoryContext, userInput);
         conversationHistory.add(ImageReferenceParser.userMessage(
                 userMessageContent,
                 Path.of(toolRegistry.getProjectPath())));
@@ -342,16 +347,16 @@ public class Agent {
     }
 
     /**
-     * 将记忆上下文注入到 system prompt 中（替换 conversationHistory[0]）
+     * 刷新 conversationHistory[0] 的 system prompt（不含每轮变化的 memoryContext）。
+     * 内容只随 skill 索引 / 外部资源 / 项目记忆变化，否则跨轮一致以利 prefix cache。
      */
-    private void updateSystemPromptWithMemory(String memoryContext) {
-        conversationHistory.set(0, LlmClient.Message.system(buildSystemPrompt(memoryContext)));
+    private void refreshSystemPrompt() {
+        conversationHistory.set(0, LlmClient.Message.system(buildSystemPrompt()));
     }
 
-    private String buildSystemPrompt(String memoryContext) {
+    private String buildSystemPrompt() {
         return promptAssembler.assemble(PromptMode.AGENT, PromptContext.builder()
                 .projectMemoryContext(buildProjectMemoryContext())
-                .memoryContext(memoryContext)
                 .externalContext(buildExternalContext())
                 .skillIndex(buildSkillIndex())
                 .build());
@@ -427,6 +432,18 @@ public class Agent {
         String drained = skillContextBuffer.drain();
         if (drained.isEmpty()) return userInput;
         return drained + "\n用户输入：\n" + userInput;
+    }
+
+    /**
+     * 组装本轮 user 消息：相关长期记忆（每轮变） + skill body + 原始输入。
+     * memoryContext 从 system prompt 挪到这里，保持 system prompt 跨轮稳定以命中 prefix cache。
+     */
+    private String prependMemoryAndSkills(String memoryContext, String userInput) {
+        String withSkills = prependSkillBodies(userInput);
+        if (memoryContext == null || memoryContext.isBlank()) {
+            return withSkills;
+        }
+        return memoryContext + "\n\n" + withSkills;
     }
 
     private String buildExternalContext() {

@@ -1251,7 +1251,10 @@ public class ToolRegistry {
      * 获取所有工具定义（用于LLM）
      */
     public List<com.paicli.llm.LlmClient.Tool> getToolDefinitions() {
+        // 按工具名排序输出：tools 是 ConcurrentHashMap，迭代顺序不稳定；若每轮顺序变，
+        // 工具定义 JSON 跟着变，破坏平台 prefix cache 命中。排序后跨轮字节稳定。
         return tools.values().stream()
+                .sorted(java.util.Comparator.comparing(Tool::name))
                 .map(t -> new com.paicli.llm.LlmClient.Tool(t.name(), t.description(), t.parameters()))
                 .toList();
     }
