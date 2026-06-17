@@ -135,7 +135,7 @@ java -jar target/sagecli-1.0-SNAPSHOT.jar
 
 ### 4. 进入 Plan / Team 模式
 
-默认是 ReAct。`/plan` 让下一条任务走 Plan-and-Execute，`/team` 走 Multi-Agent，执行完自动回到 ReAct；输入任务前按 ESC 或 `/react` 可取消。也可一条命令直接执行：
+默认是 ReAct。`/plan` 切到 Plan-and-Execute、`/team` 切到 Multi-Agent，都是**粘性模式**：切入后之后每条任务都走该模式，直到 `/react` 退回 ReAct 或 `/plan`↔`/team` 互切；运行中任务按 ESC 中断（不改模式）。一个对话窗口内三模式共享同一上下文，切换不丢前文。也可一条命令直接执行（同样会切到该模式）：
 
 ```text
 /plan 创建一个 demo 项目，然后读取 pom.xml，最后验证项目结构

@@ -100,6 +100,12 @@ import java.util.concurrent.atomic.AtomicReference;
  * HITL 增强：路径围栏（PathGuard）、命令快速拒绝（CommandGuard）、操作审计链（AuditLog）—— 见 com.paicli.policy
  */
 public class Main {
+    /**
+     * 当前会话的执行模式。粘性：一旦切到 PLAN / TEAM 就持续生效，直到用户 /react 退出或切到另一模式，
+     * 不再"只对下一条任务生效、执行完自动回 ReAct"。一个对话窗口里三模式共享同一上下文。
+     */
+    private enum SessionMode { REACT, PLAN, TEAM }
+
     private static final String VERSION = "16.1.0";
     private static final String ENV_FILE = ".env";
     private static final String LOG_DIR_PROPERTY = "paicli.log.dir";
@@ -315,8 +321,7 @@ public class Main {
             } else {
                 printStartupScreen(ui, startupScreenInfo);
             }
-            boolean nextTaskUsePlanMode = false;
-            boolean nextTaskUseTeamMode = false;
+            SessionMode currentMode = SessionMode.REACT;
 
             // 会话持久化：每次启动开一个新会话 ID，对话按项目分组写盘，支持 /sessions /resume /continue
             SessionStore sessionStore = new SessionStore();
@@ -355,7 +360,7 @@ public class Main {
                 PromptInput promptInput;
                 try {
                     promptInput = readPromptInput(terminal, lineReader, renderer,
-                            nextTaskUsePlanMode || nextTaskUseTeamMode, spaciousPrompt);
+                            false, spaciousPrompt);
                 } catch (UserInterruptException e) {
                     continue;  // Ctrl+C 跳过
                 } catch (EndOfFileException e) {
@@ -366,14 +371,8 @@ public class Main {
                 }
 
                 if (promptInput.canceled()) {
-                    if (nextTaskUsePlanMode) {
-                        nextTaskUsePlanMode = false;
-                        ui.println("↩️ 已取消待执行的 Plan-and-Execute，回到默认 ReAct。\n");
-                    }
-                    if (nextTaskUseTeamMode) {
-                        nextTaskUseTeamMode = false;
-                        ui.println("↩️ 已取消待执行的 Multi-Agent，回到默认 ReAct。\n");
-                    }
+                    // 粘性模式下输入提示符处不再用 ESC 取消"待执行模式"（模式是持久态，用 /react 退出）；
+                    // ESC 仅用于中断运行中的任务（见 runWithCancelSupport）。这里仅兜底跳过空取消。
                     continue;
                 }
 
@@ -483,26 +482,25 @@ public class Main {
                         continue;
                     }
                     case SWITCH_PLAN -> {
+                        currentMode = SessionMode.PLAN;
                         if (command.payload() == null || command.payload().isEmpty()) {
-                            nextTaskUsePlanMode = true;
-                            ui.println("📋 下一条任务将使用 Plan-and-Execute 模式，输入任务前按 ESC 或输入 /react 可取消，执行完成后自动回到默认 ReAct。\n");
+                            ui.println("📋 已切换到 Plan-and-Execute 模式，之后每条任务都走 Plan，输入 /react 退回默认 ReAct、/team 切到 Multi-Agent。\n");
                             continue;
                         }
                         input = command.payload();
                     }
                     case SWITCH_TEAM -> {
+                        currentMode = SessionMode.TEAM;
                         if (command.payload() == null || command.payload().isEmpty()) {
-                            nextTaskUseTeamMode = true;
-                            ui.println("👥 下一条任务将使用 Multi-Agent 协作模式（规划者 + 执行者 + 检查者），输入任务前按 ESC 或输入 /react 可取消，执行完成后自动回到默认 ReAct。\n");
+                            ui.println("👥 已切换到 Multi-Agent 协作模式（规划者 + 执行者 + 检查者），之后每条任务都走 Multi-Agent，输入 /react 退回默认 ReAct、/plan 切到 Plan。\n");
                             continue;
                         }
                         input = command.payload();
                     }
                     case SWITCH_REACT -> {
-                        if (nextTaskUsePlanMode || nextTaskUseTeamMode) {
-                            nextTaskUsePlanMode = false;
-                            nextTaskUseTeamMode = false;
-                            ui.println("↩️ 已取消待执行的 Plan / Multi-Agent，回到默认 ReAct 模式。\n");
+                        if (currentMode != SessionMode.REACT) {
+                            currentMode = SessionMode.REACT;
+                            ui.println("↩️ 已切回默认 ReAct 模式。\n");
                         } else {
                             ui.println("✅ 当前已是默认 ReAct 模式。\n");
                         }
@@ -788,17 +786,18 @@ public class Main {
                 final String taskInput = input;
                 Callable<String> runTask;
                 String snapshotMode;
-                if (nextTaskUsePlanMode || command.type() == CliCommandParser.CommandType.SWITCH_PLAN) {
+                if (currentMode == SessionMode.PLAN) {
                     snapshotMode = "plan";
                     LlmClient activeClient = llmClient;
                     runTask = () -> {
                         PlanExecuteAgent planAgent = createPlanAgent(activeClient, reactAgent, terminal, lineReader, ui);
                         planAgent.setExternalContextSupplier(mcpServerManager::resourceIndexForPrompt);
+                        planAgent.setSharedHistorySupplier(reactAgent::sharedHistoryForSeeding);
                         planAgent.setSkillRegistry(skillRegistry);
                         planAgent.setSkillContextBuffer(skillContextBuffer);
                         return planAgent.run(taskInput);
                     };
-                } else if (nextTaskUseTeamMode || command.type() == CliCommandParser.CommandType.SWITCH_TEAM) {
+                } else if (currentMode == SessionMode.TEAM) {
                     snapshotMode = "team";
                     LlmClient activeClient = llmClient;
                     runTask = () -> {
@@ -817,11 +816,12 @@ public class Main {
                 String response = runWithCancelSupport(terminal,
                         ui,
                         () -> snapshotService.runTurn(snapshotMode, taskInput, runTask::call));
+                // plan/team 跑完把这一轮（用户输入 + 结果摘要）并入共享对话历史，让切回 ReAct / 下一轮能接上；
+                // ReAct 自己已写入 conversationHistory，无需重复。
                 if (!"react".equals(snapshotMode)) {
+                    reactAgent.appendExternalTurn(taskInput, response);
                     renderer.updateStatus(statusInfo(llmClient, hitlHandler, "idle", mcpServerManager, skillRegistry));
                 }
-                nextTaskUsePlanMode = false;
-                nextTaskUseTeamMode = false;
                 persistTurn(sessionStore, sessionProjectKey, currentSessionId[0],
                         reactAgent, historySizeBefore, taskInput, response, snapshotMode);
                 if (response != null && !response.isBlank()) {
@@ -1439,13 +1439,14 @@ public class Main {
         try {
             long now = System.currentTimeMillis();
             List<LlmClient.Message> history = reactAgent.getConversationHistory();
-            if ("react".equals(snapshotMode) && history.size() > historySizeBefore) {
+            // 三模式统一：plan/team 跑完也通过 appendExternalTurn 把这一轮并入了共享 conversationHistory，
+            // 所以只要历史增长就走 delta 持久化。若期间触发压缩导致历史反而变短，回退到只记本轮输入与回复。
+            if (history.size() > historySizeBefore) {
                 for (int i = historySizeBefore; i < history.size(); i++) {
                     sessionStore.appendMessage(projectKey, sessionId,
                             SessionMessageRecord.from(history.get(i), now));
                 }
             } else {
-                // plan/team：历史在别的 agent 里，至少记录这一轮的用户输入与最终回复
                 if (userInput != null && !userInput.isBlank()) {
                     sessionStore.appendMessage(projectKey, sessionId,
                             SessionMessageRecord.from(LlmClient.Message.user(userInput), now));

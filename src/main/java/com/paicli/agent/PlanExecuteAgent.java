@@ -112,6 +112,7 @@ public class PlanExecuteAgent {
     private final ConversationHistoryCompactor historyCompactor;
     private final PrintStream out;
     private Supplier<String> externalContextSupplier = () -> "";
+    private Supplier<List<LlmClient.Message>> sharedHistorySupplier = List::of;
     private SkillRegistry skillRegistry;
     private SkillContextBuffer skillContextBuffer;
     private final PromptAssembler promptAssembler = PromptAssembler.createDefault();
@@ -175,6 +176,15 @@ public class PlanExecuteAgent {
 
     public void setExternalContextSupplier(Supplier<String> externalContextSupplier) {
         this.externalContextSupplier = externalContextSupplier == null ? () -> "" : externalContextSupplier;
+    }
+
+    /**
+     * 注入共享对话历史源（通常是 ReAct Agent 的 conversationHistory 快照，已去掉其 system 消息）。
+     * 每个任务播种 messages 时把它插在任务 system prompt 之后、任务输入之前，让 plan 任务看得到
+     * 同一窗口内此前的完整对话。默认空，单测/独立使用时不依赖 ReAct。
+     */
+    public void setSharedHistorySupplier(Supplier<List<LlmClient.Message>> sharedHistorySupplier) {
+        this.sharedHistorySupplier = sharedHistorySupplier == null ? List::of : sharedHistorySupplier;
     }
 
     public void setSkillRegistry(SkillRegistry skillRegistry) {
@@ -446,6 +456,19 @@ public class PlanExecuteAgent {
 
     private static final int MAX_TASK_ITERATIONS = 5;
 
+    // 连续多少轮"工具调用全部失败"就判定任务卡死，提前抛异常交给重规划。
+    // 失败包含策略拒绝（路径越界等）、工具异常、超时——这些靠 ToolExecutionResult.failed() 结构化判定，
+    // 不靠匹配 "🛡️ 策略拒绝" 文本。阈值 2：给模型一次纠错机会，但不让它把 5 轮额度耗在同一个死路上。
+    private static final int MAX_CONSECUTIVE_FAILED_ITERATIONS =
+            Integer.getInteger("paicli.plan.max.consecutive.failed.iterations", 2);
+
+    /** 单任务连续工具失败到阈值时抛出，沿 executeTaskBatch 的 catch 传播到 executePlan 的失败/重规划分支。 */
+    static final class TaskStalledException extends RuntimeException {
+        TaskStalledException(String message) {
+            super(message);
+        }
+    }
+
     /**
      * 执行单个任务（支持多轮工具调用）
      */
@@ -468,15 +491,21 @@ public class PlanExecuteAgent {
         }
         taskInput = prependSkillBodies(taskInput);
 
-        List<LlmClient.Message> messages = new ArrayList<>(Arrays.asList(
-                LlmClient.Message.system(prompt),
-                ImageReferenceParser.userMessage(
-                        taskInput,
-                        Path.of(toolRegistry.getProjectPath()))
-        ));
+        List<LlmClient.Message> messages = new ArrayList<>();
+        messages.add(LlmClient.Message.system(prompt));
+        // 播种同一窗口内的共享对话历史（去掉 system 消息），让 plan 任务看得到此前的 ReAct/plan 对话上下文。
+        List<LlmClient.Message> sharedHistory = safeSharedHistory();
+        if (!sharedHistory.isEmpty()) {
+            messages.addAll(sharedHistory);
+        }
+        messages.add(ImageReferenceParser.userMessage(
+                taskInput,
+                Path.of(toolRegistry.getProjectPath())));
 
         StringBuilder allResults = new StringBuilder();
         int iteration = 0;
+        int consecutiveFailedIterations = 0;
+        String lastFailureDetail = null;
         TaskStreamRenderer streamRenderer = new TaskStreamRenderer(task.getId(), streamState, out);
 
         int totalInputTokens = 0;
@@ -555,6 +584,26 @@ public class PlanExecuteAgent {
                 messages.add(LlmClient.Message.tool(toolResult.id(), toolResult.result()));
             }
             appendImageToolMessages(messages, toolResults);
+
+            // 连续失败检测：本轮工具调用如果全部失败（策略拒绝/异常/超时），累加计数；
+            // 只要有一个成功就清零。连续达到阈值说明模型在同一个死路上空转，提前抛异常交给重规划，
+            // 而不是耗满 MAX_TASK_ITERATIONS 后把一堆 "🛡️ 策略拒绝" 当成正常结果返回。
+            if (!toolResults.isEmpty() && toolResults.stream().allMatch(ToolExecutionResult::failed)) {
+                consecutiveFailedIterations++;
+                lastFailureDetail = toolResults.stream()
+                        .map(ToolExecutionResult::result)
+                        .collect(Collectors.joining("；"));
+                if (consecutiveFailedIterations >= MAX_CONSECUTIVE_FAILED_ITERATIONS) {
+                    streamRenderer.finish();
+                    String detail = preview(lastFailureDetail, 200);
+                    log.warn("Task {} stalled: {} consecutive failed iterations, lastFailure={}",
+                            task.getId(), consecutiveFailedIterations, detail);
+                    throw new TaskStalledException(
+                            "连续 " + consecutiveFailedIterations + " 轮工具调用全部失败，疑似卡死：" + detail);
+                }
+            } else {
+                consecutiveFailedIterations = 0;
+            }
         }
 
         String fallbackResult = allResults.toString().trim();
@@ -563,6 +612,16 @@ public class PlanExecuteAgent {
         }
         streamRenderer.finish();
         return TaskRunResult.of(fallbackResult, streamRenderer.hasStreamedOutput());
+    }
+
+    private List<LlmClient.Message> safeSharedHistory() {
+        try {
+            List<LlmClient.Message> history = sharedHistorySupplier.get();
+            return history == null ? List.of() : history;
+        } catch (Exception e) {
+            log.warn("Failed to obtain shared history for plan task", e);
+            return List.of();
+        }
     }
 
     private String buildExternalContext() {

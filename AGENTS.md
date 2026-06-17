@@ -43,7 +43,11 @@ mvn test -DskipTests=false                  # 全量回归
 | Plan-and-Execute | `PlanExecuteAgent.java` | `/plan` |
 | Multi-Agent | `AgentOrchestrator.java` | `/team` |
 
-`/plan` / `/team` 只对下一条任务生效，执行完自动回到 ReAct；输入任务前可用 `/react`（或 ESC）取消待执行的 plan/team 模式。
+`/plan` / `/team` 是**粘性模式**：一旦切入就持续生效，之后每条任务都走该模式，直到用户 `/react` 退回默认 ReAct、或 `/plan`↔`/team` 互切。不再"只对下一条任务生效、执行完自动回 ReAct"。运行中任务用 ESC 中断（不改模式）。
+
+一个对话窗口内三模式**共享同一上下文**：plan/team 每条任务播种 ReAct 的完整 `conversationHistory`（去掉其 system 消息），任务跑完再经 `Agent.appendExternalTurn()` 把"用户输入 + 结果摘要"并入共享历史，超窗自动压缩。所以切回 ReAct / 下一轮 plan/team 都能接上前文，`persistTurn` 三模式统一走 delta 持久化。
+
+plan 单任务连续失败保护：`PlanExecuteAgent` 连续 N 轮（默认 2，`paicli.plan.max.consecutive.failed.iterations`）工具调用全部失败（策略拒绝/异常/超时，靠 `ToolExecutionResult.failed()` 结构化判定，不匹配文本）即抛 `TaskStalledException` 判任务失败 → 进自动重规划，避免耗满 5 轮把一堆"🛡️ 策略拒绝"当成"完成"。
 
 会话恢复：对话按项目分组持久化到 `~/.paicli/sessions/<projectHash>/<sessionId>.jsonl`（存全 toolCalls/toolCallId，恢复后协议正确）；`/sessions` 列表、`/resume <id>` 恢复指定、`/continue` 接最近一次。恢复经 `Agent.restoreConversationHistory()`，会同步重建 MemoryManager 短期记忆。
 

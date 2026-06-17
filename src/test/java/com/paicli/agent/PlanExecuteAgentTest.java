@@ -210,6 +210,55 @@ class PlanExecuteAgentTest {
                 "应引导用户用 /plan 重新��述目标: " + result);
     }
 
+    @Test
+    void shouldFailTaskOnConsecutivePolicyRejectionsInsteadOfFakeCompletion() throws Exception {
+        // 模拟 bug 场景：模型反复让 read_file 读项目根外的路径，每次都被 PathGuard 判越界拒绝。
+        // 期望：连续失败达到阈值后任务判失败 → 触发重规划（单任务 progress<0.5），
+        // 而不是耗满 5 轮把一堆 "🛡️ 策略拒绝" 当成正常结果、把任务标成"完成"。
+        LlmClient.ChatResponse badPathCall = new LlmClient.ChatResponse(
+                "assistant",
+                "",
+                List.of(new LlmClient.ToolCall(
+                        "call_bad",
+                        new LlmClient.ToolCall.Function(
+                                "read_file",
+                                "{\"path\":\"/etc/passwd\"}"
+                        )
+                )),
+                100,
+                20
+        );
+        // 足够多份相同的越界调用，覆盖初次执行 + 2 次重规划，每次执行 2 轮即触发停滞。
+        StubGLMClient llmClient = new StubGLMClient(java.util.Collections.nCopies(12, badPathCall));
+
+        MemoryManager memoryManager = new MemoryManager(
+                llmClient,
+                4096,
+                128000,
+                new LongTermMemory(tempDir.resolve("memory-store-stall").toFile())
+        );
+        ToolRegistry toolRegistry = new ToolRegistry();
+        toolRegistry.setProjectPath(tempDir.toString());
+
+        FailingStubPlanner planner = new FailingStubPlanner(llmClient);
+        PlanExecuteAgent agent = new PlanExecuteAgent(
+                llmClient,
+                toolRegistry,
+                planner,
+                memoryManager,
+                (goal, plan) -> PlanExecuteAgent.PlanReviewDecision.execute()
+        );
+
+        String result = agent.run("读取系统密码文件");
+
+        assertTrue(planner.replanCalls >= 1,
+                "连续策略拒绝应判任务失败并触发重规划，而不是伪完成: replanCalls=" + planner.replanCalls);
+        assertFalse(result.contains("计划执行完成"),
+                "连续策略拒绝的任务不应被当成成功完成: " + result);
+        assertTrue(result.contains("自动重规划已停止"),
+                "重规划用尽后应返回明确的停止信息: " + result);
+    }
+
     private record StubResponse(LlmClient.ChatResponse response, boolean streamContent,
                                 java.util.function.Consumer<LlmClient.StreamListener> streamScript) {
         private static StubResponse plain(LlmClient.ChatResponse response) {

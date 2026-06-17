@@ -456,6 +456,44 @@ public class Agent {
         return memoryManager;
     }
 
+    /**
+     * 供 plan/team 模式播种任务上下文用：返回共享对话历史的快照，去掉首条 system 消息
+     * （plan/team 任务有自己的 system prompt）。assistant tool_calls 与其后的 tool 消息成对保留，协议正确。
+     */
+    public List<LlmClient.Message> sharedHistoryForSeeding() {
+        List<LlmClient.Message> snapshot = new ArrayList<>();
+        for (int i = 0; i < conversationHistory.size(); i++) {
+            LlmClient.Message message = conversationHistory.get(i);
+            if (i == 0 && message != null && "system".equals(message.role())) {
+                continue;
+            }
+            if (message != null) {
+                snapshot.add(message);
+            }
+        }
+        return snapshot;
+    }
+
+    /**
+     * plan/team 模式整轮跑完后，把这一轮的用户输入与最终结果摘要并入共享对话历史，
+     * 让随后切回 ReAct（或下一轮 plan/team）的 LLM 看得到此前发生了什么。一个窗口内三模式共享同一上下文。
+     * 写入后顺手做一次超窗压缩（满了就压缩）。
+     */
+    public void appendExternalTurn(String userInput, String assistantSummary) {
+        if (userInput != null && !userInput.isBlank()) {
+            conversationHistory.add(LlmClient.Message.user(userInput));
+        }
+        if (assistantSummary != null && !assistantSummary.isBlank()) {
+            conversationHistory.add(LlmClient.Message.assistant(assistantSummary));
+        }
+        try {
+            int trigger = memoryManager.getContextProfile().compressionTriggerTokens();
+            historyCompactor.compactIfNeeded(conversationHistory, trigger);
+        } catch (Exception e) {
+            log.warn("appendExternalTurn compaction failed", e);
+        }
+    }
+
     private void storeExplicitBrowserMemoryHint(String userInput) {
         List<String> recentTexts = conversationHistory.stream()
                 .map(LlmClient.Message::content)

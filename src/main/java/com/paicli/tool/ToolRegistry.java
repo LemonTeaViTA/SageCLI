@@ -1249,13 +1249,13 @@ public class ToolRegistry {
                 auditLog.record(AuditLog.AuditEntry.denyByPolicy(
                         name, argumentsJson, e.getMessage(), elapsedMillis(start), auditMetadata));
             }
-            return ToolOutput.text("🛡️ 策略拒绝: " + e.getMessage());
+            return ToolOutput.failure("🛡️ 策略拒绝: " + e.getMessage());
         } catch (Exception e) {
             if (shouldAudit) {
                 auditLog.record(AuditLog.AuditEntry.error(
                         name, argumentsJson, e.getMessage(), elapsedMillis(start), auditMetadata));
             }
-            return ToolOutput.text("工具执行失败: " + e.getMessage());
+            return ToolOutput.failure("工具执行失败: " + e.getMessage());
         }
     }
 
@@ -1473,7 +1473,8 @@ public class ToolRegistry {
 
     public record ToolExecutionResult(String id, String name, String argumentsJson,
                                       String result, long elapsedMillis, boolean timedOut,
-                                      List<com.paicli.llm.LlmClient.ContentPart> imageParts) {
+                                      List<com.paicli.llm.LlmClient.ContentPart> imageParts,
+                                      boolean failed) {
         private static ToolExecutionResult completed(ToolInvocation invocation, ToolOutput output, long elapsedMillis) {
             return new ToolExecutionResult(
                     invocation.id(),
@@ -1482,7 +1483,8 @@ public class ToolRegistry {
                     output == null ? "" : output.text(),
                     elapsedMillis,
                     false,
-                    output == null ? List.of() : output.imageParts());
+                    output == null ? List.of() : output.imageParts(),
+                    output != null && output.failed());
         }
 
         private static ToolExecutionResult completed(ToolInvocation invocation, String result, long elapsedMillis) {
@@ -1490,7 +1492,7 @@ public class ToolRegistry {
         }
 
         private static ToolExecutionResult failed(ToolInvocation invocation, String message) {
-            return completed(invocation, "工具执行失败: " + message, 0);
+            return completed(invocation, ToolOutput.failure("工具执行失败: " + message), 0);
         }
 
         private static ToolExecutionResult timedOut(ToolInvocation invocation, long timeoutSeconds) {
@@ -1501,7 +1503,8 @@ public class ToolRegistry {
                     "工具执行超时（" + timeoutSeconds + "秒），已取消",
                     timeoutSeconds * 1000,
                     true,
-                    List.of()
+                    List.of(),
+                    true
             );
         }
 
