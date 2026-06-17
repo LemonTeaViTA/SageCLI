@@ -480,10 +480,37 @@ public class Agent {
      * 写入后顺手做一次超窗压缩（满了就压缩）。
      */
     public void appendExternalTurn(String userInput, String assistantSummary) {
+        appendExternalTurn(userInput, List.of(), assistantSummary);
+    }
+
+    /**
+     * 把 plan/team 这一轮写回共享对话历史，对齐 Claude Code "全量传输"的方式：
+     * <ol>
+     *   <li>user(原始输入)</li>
+     *   <li>executionDelta — 执行期间新增的 assistant/tool 消息（工具调用 + 工具结果 + 中间推理）</li>
+     *   <li>assistant(最终汇总) —— 仅当非空且 delta 末尾尚无文字 content 时追加，避免重复</li>
+     * </ol>
+     * 超窗后触发 historyCompactor 压缩，保持窗口在阈值内。
+     */
+    public void appendExternalTurn(String userInput,
+                                   List<LlmClient.Message> executionDelta,
+                                   String assistantSummary) {
         if (userInput != null && !userInput.isBlank()) {
             conversationHistory.add(LlmClient.Message.user(userInput));
         }
-        if (assistantSummary != null && !assistantSummary.isBlank()) {
+        if (executionDelta != null) {
+            for (LlmClient.Message msg : executionDelta) {
+                if (msg != null && !"system".equals(msg.role())) {
+                    conversationHistory.add(msg);
+                }
+            }
+        }
+        // 只在 delta 末尾没有实质 assistant 文字时才追加汇总，避免重复
+        boolean deltaEndsWithAssistantText = !conversationHistory.isEmpty()
+                && "assistant".equals(conversationHistory.get(conversationHistory.size() - 1).role())
+                && conversationHistory.get(conversationHistory.size() - 1).content() != null
+                && !conversationHistory.get(conversationHistory.size() - 1).content().isBlank();
+        if (!deltaEndsWithAssistantText && assistantSummary != null && !assistantSummary.isBlank()) {
             conversationHistory.add(LlmClient.Message.assistant(assistantSummary));
         }
         try {

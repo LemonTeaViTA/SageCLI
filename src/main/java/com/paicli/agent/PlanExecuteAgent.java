@@ -46,33 +46,44 @@ public class PlanExecuteAgent {
     // 默认 2，与 AgentOrchestrator.MAX_RETRIES_PER_STEP 的重试语义保持一致；可用系统属性覆盖（CI/批跑可调大）。
     private static final int MAX_REPLAN_ATTEMPTS =
             Integer.getInteger("paicli.plan.max.replan.attempts", 2);
-    private record PlanRunOutcome(String result, boolean persistAssistantMessage) {
-        static PlanRunOutcome executed(String result) {
-            return new PlanRunOutcome(result, true);
+    private record PlanRunOutcome(String result, boolean persistAssistantMessage,
+                                  List<LlmClient.Message> executionDelta) {
+        static PlanRunOutcome executed(String result, List<LlmClient.Message> delta) {
+            return new PlanRunOutcome(result, true, delta);
         }
 
         static PlanRunOutcome canceled(String result) {
-            return new PlanRunOutcome(result, false);
+            return new PlanRunOutcome(result, false, List.of());
         }
 
         static PlanRunOutcome failed(String result) {
-            return new PlanRunOutcome(result, true);
+            return new PlanRunOutcome(result, true, List.of());
         }
     }
 
-    private record TaskRunResult(String result, boolean streamedOutput) {
+    private record TaskRunResult(String result, boolean streamedOutput,
+                                 List<LlmClient.Message> deltaMessages) {
+        static TaskRunResult of(String result, boolean streamedOutput,
+                                List<LlmClient.Message> deltaMessages) {
+            return new TaskRunResult(result, streamedOutput,
+                    deltaMessages == null ? List.of() : List.copyOf(deltaMessages));
+        }
+
+        /** 向后兼容：无 delta（取消/降级路径）。 */
         static TaskRunResult of(String result, boolean streamedOutput) {
-            return new TaskRunResult(result, streamedOutput);
+            return new TaskRunResult(result, streamedOutput, List.of());
         }
     }
 
-    private record TaskExecutionResult(Task task, String result, boolean streamedOutput, Exception error) {
+    private record TaskExecutionResult(Task task, String result, boolean streamedOutput,
+                                       List<LlmClient.Message> deltaMessages, Exception error) {
         static TaskExecutionResult success(Task task, TaskRunResult taskRunResult) {
-            return new TaskExecutionResult(task, taskRunResult.result(), taskRunResult.streamedOutput(), null);
+            return new TaskExecutionResult(task, taskRunResult.result(),
+                    taskRunResult.streamedOutput(), taskRunResult.deltaMessages(), null);
         }
 
         static TaskExecutionResult failure(Task task, Exception error) {
-            return new TaskExecutionResult(task, null, false, error);
+            return new TaskExecutionResult(task, null, false, List.of(), error);
         }
 
         boolean failed() {
@@ -227,31 +238,41 @@ public class PlanExecuteAgent {
         return drained + "\n" + content;
     }
 
+    /** 运行结果：执行摘要文本 + 完整工具调用 delta（供调用方写回共享对话历史）。 */
+    public record PlanRunResult(String result, List<LlmClient.Message> executionDelta) {}
+
     /**
-     * 运行任务（自动判断是否需要规划）
+     * 运行任务，返回结果文本 + 执行 delta。
+     * Main 拿到 delta 后调用 Agent.appendExternalTurn 写回共享对话历史，让 ReAct 看得到完整上下文。
      */
-    public String run(String userInput) {
+    public PlanRunResult runFull(String userInput) {
         log.info("Plan run started: inputLength={}", userInput == null ? 0 : userInput.length());
         memoryManager.addUserMessage(userInput);
         StreamState streamState = new StreamState();
         try {
             if (CancellationContext.isCancelled()) {
-                return "⏹️ 已取消当前计划执行。";
+                return new PlanRunResult("⏹️ 已取消当前计划执行。", List.of());
             }
             PlanRunOutcome outcome = runWithPlan(userInput, streamState);
             if (outcome.persistAssistantMessage() && outcome.result() != null && !outcome.result().isBlank()) {
                 memoryManager.addAssistantMessage("[计划结果] " + outcome.result());
             }
-            if (streamState.hasStreamedOutput() && (outcome.result() == null || outcome.result().isBlank())) {
-                return "";
-            }
-            return outcome.result();
+            String result = (streamState.hasStreamedOutput() && (outcome.result() == null || outcome.result().isBlank()))
+                    ? "" : outcome.result();
+            return new PlanRunResult(result, outcome.executionDelta());
         } catch (Exception e) {
             log.error("Plan run failed", e);
             String errorMessage = "❌ 执行失败: " + e.getMessage();
             memoryManager.addAssistantMessage(errorMessage);
-            return errorMessage;
+            return new PlanRunResult(errorMessage, List.of());
         }
+    }
+
+    /**
+     * 运行任务（自动判断是否需要规划）- 向后兼容，仅返回结果文本。
+     */
+    public String run(String userInput) {
+        return runFull(userInput).result();
     }
 
 /**
@@ -262,11 +283,22 @@ public class PlanExecuteAgent {
         return reviewAndExecutePlan(plan, streamState, 0);
     }
 
+    /** executePlan 的结构化返回：执行摘要文本 + 所有任务产出的消息 delta。 */
+    private record PlanExecResult(String summary, List<LlmClient.Message> delta) {
+        static PlanExecResult of(String summary, List<LlmClient.Message> delta) {
+            return new PlanExecResult(summary, delta == null ? List.of() : List.copyOf(delta));
+        }
+        static PlanExecResult textOnly(String summary) {
+            return new PlanExecResult(summary, List.of());
+        }
+    }
+
     private PlanRunOutcome reviewAndExecutePlan(ExecutionPlan plan, StreamState streamState, int replanAttempt) throws IOException {
         while (true) {
             PlanReviewDecision decision = reviewHandler.review(plan.getGoal(), plan);
             if (decision == null || decision.action() == PlanReviewAction.EXECUTE) {
-                return PlanRunOutcome.executed(executePlan(plan, streamState, replanAttempt));
+                PlanExecResult execResult = executePlan(plan, streamState, replanAttempt);
+                return PlanRunOutcome.executed(execResult.summary(), execResult.delta());
             }
 
             if (decision.action() == PlanReviewAction.CANCEL) {
@@ -275,7 +307,8 @@ public class PlanExecuteAgent {
 
             String feedback = decision.feedback() == null ? "" : decision.feedback().trim();
             if (feedback.isEmpty()) {
-                return PlanRunOutcome.executed(executePlan(plan, streamState, replanAttempt));
+                PlanExecResult execResult = executePlan(plan, streamState, replanAttempt);
+                return PlanRunOutcome.executed(execResult.summary(), execResult.delta());
             }
 
             out.println("📝 已收到补充要求，正在重新规划...\n");
@@ -283,17 +316,19 @@ public class PlanExecuteAgent {
         }
     }
 
-    private String executePlan(ExecutionPlan plan, StreamState streamState, int replanAttempt) throws IOException {
+    private PlanExecResult executePlan(ExecutionPlan plan, StreamState streamState, int replanAttempt) throws IOException {
         log.info("Executing plan: goal='{}', taskCount={}", plan.getGoal(), plan.getAllTasks().size());
         out.println("🚀 开始执行计划...\n");
 
         plan.markStarted();
         StringBuilder finalResult = new StringBuilder();
         Map<String, Boolean> streamedTaskOutputs = new HashMap<>();
+        // 累积所有任务执行期间新增的消息 delta（工具调用 + 工具结果 + assistant 回复）
+        List<LlmClient.Message> accumulatedDelta = new ArrayList<>();
 
         while (true) {
             if (CancellationContext.isCancelled()) {
-                return "⏹️ 已取消当前计划执行。";
+                return PlanExecResult.textOnly("⏹️ 已取消当前计划执行。");
             }
             List<Task> executableTasks = getExecutableTasksInOrder(plan);
             if (executableTasks.isEmpty()) {
@@ -307,8 +342,14 @@ public class PlanExecuteAgent {
                 if (!batchResult.failed()) {
                     task.markCompleted(batchResult.result());
                     streamedTaskOutputs.put(task.getId(), batchResult.streamedOutput());
-                    log.info("Task completed: {} status={} resultChars={}",
-                            task.getId(), task.getStatus(), batchResult.result() == null ? 0 : batchResult.result().length());
+                    // 把任务的消息 delta 并入全局累积列表
+                    if (batchResult.deltaMessages() != null) {
+                        accumulatedDelta.addAll(batchResult.deltaMessages());
+                    }
+                    log.info("Task completed: {} status={} resultChars={} deltaMessages={}",
+                            task.getId(), task.getStatus(),
+                            batchResult.result() == null ? 0 : batchResult.result().length(),
+                            batchResult.deltaMessages() == null ? 0 : batchResult.deltaMessages().size());
                     if (batchResult.streamedOutput() || batchResult.result() == null || batchResult.result().isBlank()) {
                         out.println("✅ 完成 [" + task.getId() + "]\n");
                     } else {
@@ -327,14 +368,20 @@ public class PlanExecuteAgent {
                     if (replanAttempt >= MAX_REPLAN_ATTEMPTS) {
                         log.warn("Replan limit reached: attempts={}, lastError={}", replanAttempt, error.getMessage());
                         out.println("⚠️ 已重新规划 " + replanAttempt + " 次仍失败，自动重规划已停止。\n");
-                        return "⚠️ 已重新规划 " + replanAttempt + " 次仍失败，自动重规划已停止。\n"
+                        return PlanExecResult.textOnly("⚠️ 已重新规划 " + replanAttempt + " 次仍失败，自动重规划已停止。\n"
                                 + "   最后一次失败原因：" + error.getMessage() + "\n"
                                 + "   这通常说明目标描述不够清晰，或任务超出当前能力 / 缺少前置信息。\n"
-                                + "   建议用 /plan 重新描述目标（补充约束、拆细步骤、给出关键信息）后再试。";
+                                + "   建议用 /plan 重新描述目标（补充约束、拆细步骤、给出关键信息）后再试。");
                     }
                     out.println("🔄 尝试重新规划...（第 " + (replanAttempt + 1) + "/" + MAX_REPLAN_ATTEMPTS + " 次）\n");
                     ExecutionPlan replanned = planner.replan(plan, error.getMessage());
-                    return reviewAndExecutePlan(replanned, streamState, replanAttempt + 1).result();
+                    // 重规划时当前已累积的 delta 也要传递下去
+                    PlanRunOutcome replanOutcome = reviewAndExecutePlan(replanned, streamState, replanAttempt + 1);
+                    List<LlmClient.Message> mergedDelta = new ArrayList<>(accumulatedDelta);
+                    if (replanOutcome.executionDelta() != null) {
+                        mergedDelta.addAll(replanOutcome.executionDelta());
+                    }
+                    return PlanExecResult.of(replanOutcome.result(), mergedDelta);
                 }
 
                 if (!finalResult.isEmpty()) {
@@ -346,7 +393,7 @@ public class PlanExecuteAgent {
 
         if (!plan.isAllCompleted() && !plan.hasFailed()) {
             plan.markFailed();
-            return "⚠️ 计划未能继续推进，存在未满足依赖的任务。";
+            return PlanExecResult.of("⚠️ 计划未能继续推进，存在未满足依赖的任务。", accumulatedDelta);
         }
 
         String planSummary = finalResult.isEmpty()
@@ -356,16 +403,16 @@ public class PlanExecuteAgent {
         if (plan.hasFailed()) {
             plan.markFailed();
             if (planSummary.isBlank()) {
-                return "⚠️ 计划部分完成，有任务失败。";
+                return PlanExecResult.of("⚠️ 计划部分完成，有任务失败。", accumulatedDelta);
             }
-            return "⚠️ 计划部分完成，有任务失败。\n" + planSummary;
+            return PlanExecResult.of("⚠️ 计划部分完成，有任务失败。\n" + planSummary, accumulatedDelta);
         }
 
         plan.markCompleted();
         if (planSummary.isBlank()) {
-            return "✅ 计划执行完成！";
+            return PlanExecResult.of("✅ 计划执行完成！", accumulatedDelta);
         }
-        return "✅ 计划执行完成！\n" + planSummary;
+        return PlanExecResult.of("✅ 计划执行完成！\n" + planSummary, accumulatedDelta);
     }
 
     private List<Task> getExecutableTasksInOrder(ExecutionPlan plan) {
@@ -502,6 +549,11 @@ public class PlanExecuteAgent {
                 taskInput,
                 Path.of(toolRegistry.getProjectPath())));
 
+        // seedSize：种子消息数（system + 共享历史 + 任务 user 消息）。
+        // 执行期间新增的 assistant/tool 消息从 messages.subList(seedSize, ...) 取出，
+        // 作为 delta 写回共享 conversationHistory，让切回 ReAct 后模型看到完整执行链。
+        final int seedSize = messages.size();
+
         StringBuilder allResults = new StringBuilder();
         int iteration = 0;
         int consecutiveFailedIterations = 0;
@@ -556,13 +608,17 @@ public class PlanExecuteAgent {
                         memoryManager.addAssistantMessage("[计划任务 " + task.getId() + "] " + toolOnlyResult);
                     }
                     streamRenderer.finish();
-                    return TaskRunResult.of(toolOnlyResult, streamRenderer.hasStreamedOutput());
+                    return TaskRunResult.of(toolOnlyResult, streamRenderer.hasStreamedOutput(),
+                            new ArrayList<>(messages.subList(Math.min(seedSize, messages.size()), messages.size())));
                 }
                 if (response.content() != null && !response.content().isBlank()) {
                     memoryManager.addAssistantMessage("[计划任务 " + task.getId() + "] " + response.content());
+                    // 把最终 assistant 回复也加进 messages，让 delta 包含它
+                    messages.add(LlmClient.Message.assistant(response.content()));
                 }
                 streamRenderer.finish();
-                return TaskRunResult.of(response.content(), streamRenderer.hasStreamedOutput());
+                return TaskRunResult.of(response.content(), streamRenderer.hasStreamedOutput(),
+                        new ArrayList<>(messages.subList(Math.min(seedSize, messages.size()), messages.size())));
             }
 
             // 有工具调用：执行工具并将结果回灌到消息历史
@@ -611,7 +667,8 @@ public class PlanExecuteAgent {
             memoryManager.addAssistantMessage("[计划任务 " + task.getId() + "] " + fallbackResult);
         }
         streamRenderer.finish();
-        return TaskRunResult.of(fallbackResult, streamRenderer.hasStreamedOutput());
+        return TaskRunResult.of(fallbackResult, streamRenderer.hasStreamedOutput(),
+                new ArrayList<>(messages.subList(Math.min(seedSize, messages.size()), messages.size())));
     }
 
     private List<LlmClient.Message> safeSharedHistory() {

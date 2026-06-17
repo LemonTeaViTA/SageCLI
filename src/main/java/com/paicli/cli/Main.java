@@ -786,6 +786,8 @@ public class Main {
                 final String taskInput = input;
                 Callable<String> runTask;
                 String snapshotMode;
+                java.util.concurrent.atomic.AtomicReference<java.util.List<com.paicli.llm.LlmClient.Message>>
+                        planDeltaRef = new java.util.concurrent.atomic.AtomicReference<>(java.util.List.of());
                 if (currentMode == SessionMode.PLAN) {
                     snapshotMode = "plan";
                     LlmClient activeClient = llmClient;
@@ -795,7 +797,9 @@ public class Main {
                         planAgent.setSharedHistorySupplier(reactAgent::sharedHistoryForSeeding);
                         planAgent.setSkillRegistry(skillRegistry);
                         planAgent.setSkillContextBuffer(skillContextBuffer);
-                        return planAgent.run(taskInput);
+                        PlanExecuteAgent.PlanRunResult planResult = planAgent.runFull(taskInput);
+                        planDeltaRef.set(planResult.executionDelta());
+                        return planResult.result();
                     };
                 } else if (currentMode == SessionMode.TEAM) {
                     snapshotMode = "team";
@@ -816,10 +820,11 @@ public class Main {
                 String response = runWithCancelSupport(terminal,
                         ui,
                         () -> snapshotService.runTurn(snapshotMode, taskInput, runTask::call));
-                // plan/team 跑完把这一轮（用户输入 + 结果摘要）并入共享对话历史，让切回 ReAct / 下一轮能接上；
-                // ReAct 自己已写入 conversationHistory，无需重复。
+                // plan/team 跑完把这一轮（用户输入 + 完整执行 delta + 结果汇总）并入共享对话历史，
+                // 对齐 Claude Code 全量传输方式，让切回 ReAct 后模型看得到工具调用全过程，
+                // 而不只是两条摘要消息。超窗时 appendExternalTurn 内触发压缩。
                 if (!"react".equals(snapshotMode)) {
-                    reactAgent.appendExternalTurn(taskInput, response);
+                    reactAgent.appendExternalTurn(taskInput, planDeltaRef.get(), response);
                     renderer.updateStatus(statusInfo(llmClient, hitlHandler, "idle", mcpServerManager, skillRegistry));
                 }
                 persistTurn(sessionStore, sessionProjectKey, currentSessionId[0],
