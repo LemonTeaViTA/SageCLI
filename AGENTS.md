@@ -51,9 +51,9 @@ plan 单任务连续失败保护：`PlanExecuteAgent` 连续 N 轮（默认 2，
 
 会话恢复：对话按项目分组持久化到 `~/.paicli/sessions/<projectHash>/<sessionId>.jsonl`（存全 toolCalls/toolCallId，恢复后协议正确）；`/sessions` 列表、`/resume <id>` 恢复指定、`/continue` 接最近一次。恢复经 `Agent.restoreConversationHistory()`，会同步重建 MemoryManager 短期记忆。
 
-核心内置工具 11 个：`read_file` / `write_file` / `list_dir` / `glob_files` / `grep_code` / `execute_command` / `create_project` / `search_code` / `web_search` / `web_fetch` / `revert_turn`
+核心内置工具 12 个：`read_file` / `write_file` / `edit_file` / `list_dir` / `glob_files` / `grep_code` / `execute_command` / `create_project` / `search_code` / `web_search` / `web_fetch` / `revert_turn`
 
-代码库理解默认走 Claude Code 式实时探索：`glob_files` 找候选文件、`grep_code` 精确定位符号或字符串、`read_file` 按需读取具体行段。`search_code` 是 RAG 语义辅助，适合模糊自然语言、关键词不明确、常规搜索无果、巨型/跨知识检索场景，不作为精确代码定位的首选。
+代码库理解默认走 Claude Code 式实时探索：`glob_files` 找候选文件、`grep_code` 精确定位符号或字符串、`read_file` 按需读取具体行段、`edit_file` 局部 str_replace 式修改已有文件（优先于 write_file 整文件覆写）。`search_code` 是 RAG 语义辅助，适合模糊自然语言、关键词不明确、常规搜索无果、巨型/跨知识检索场景，不作为精确代码定位的首选。
 
 MCP 动态工具：`mcp__{server}__{tool}`（+ resources 虚拟工具）
 

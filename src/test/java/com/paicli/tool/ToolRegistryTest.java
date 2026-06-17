@@ -56,6 +56,128 @@ class ToolRegistryTest {
     }
 
     @Test
+    void shouldDegradeOversizedFullReadInsteadOfLoadingAll(@TempDir Path tempDir) throws Exception {
+        // 构造一个 >5MB 的文件，不带 offset/limit 全文读取应降级为只读前若干行 + 分页提示，
+        // 而不是把整段灌进上下文（防 OOM / token 爆炸）。
+        Path big = tempDir.resolve("huge.log");
+        StringBuilder line = new StringBuilder();
+        for (int i = 0; i < 200; i++) line.append("x");
+        StringBuilder content = new StringBuilder();
+        for (int i = 0; i < 30_000; i++) {        // 30000 * ~201 字节 ≈ 6MB
+            content.append("line").append(i).append("-").append(line).append("\n");
+        }
+        Files.writeString(big, content.toString());
+        ToolRegistry registry = new ToolRegistry();
+        registry.setProjectPath(tempDir.toString());
+
+        String result = registry.executeTool("read_file", "{\"path\":\"huge.log\"}");
+
+        assertTrue(result.contains("超过 5MB 上限"), "应提示超限: " + result.substring(0, Math.min(120, result.length())));
+        assertTrue(result.contains("offset/limit 分页"), "应提示分页读取");
+        assertTrue(result.contains("    1 | line0-"), "应包含前几行内容");
+        // 降级后不应包含尾部行（证明没有整段读出）
+        assertTrue(!result.contains("line29999-"), "降级后不应含尾部内容");
+    }
+
+    @Test
+    void shouldReadNormalSizedFileInFull(@TempDir Path tempDir) throws Exception {
+        Path file = tempDir.resolve("small.txt");
+        Files.writeString(file, "hello\nworld\n");
+        ToolRegistry registry = new ToolRegistry();
+        registry.setProjectPath(tempDir.toString());
+
+        String result = registry.executeTool("read_file", "{\"path\":\"small.txt\"}");
+
+        assertTrue(result.contains("文件内容:"));
+        assertTrue(result.contains("hello"));
+        assertTrue(result.contains("world"));
+        assertTrue(!result.contains("超过 5MB"), "正常文件不应触发降级");
+    }
+
+    @Test
+    void editFileReplacesUniqueMatch(@TempDir Path tempDir) throws Exception {
+        Path file = tempDir.resolve("Sample.java");
+        Files.writeString(file, "class Sample {\n  int x = 1;\n  int y = 2;\n}\n");
+        ToolRegistry registry = new ToolRegistry();
+        registry.setProjectPath(tempDir.toString());
+
+        String result = registry.executeTool("edit_file",
+                "{\"path\":\"Sample.java\",\"old_string\":\"  int x = 1;\",\"new_string\":\"  int x = 42;\"}");
+
+        assertTrue(result.contains("文件已编辑"), result);
+        String after = Files.readString(file);
+        assertTrue(after.contains("int x = 42;"));
+        assertTrue(after.contains("int y = 2;"), "未涉及的行应保持不变");
+        assertTrue(!after.contains("int x = 1;"));
+    }
+
+    @Test
+    void editFileFailsWhenNoMatch(@TempDir Path tempDir) throws Exception {
+        Path file = tempDir.resolve("Sample.java");
+        Files.writeString(file, "class Sample {}\n");
+        ToolRegistry registry = new ToolRegistry();
+        registry.setProjectPath(tempDir.toString());
+
+        String result = registry.executeTool("edit_file",
+                "{\"path\":\"Sample.java\",\"old_string\":\"不存在的内容\",\"new_string\":\"x\"}");
+
+        assertTrue(result.contains("未找到 old_string"), result);
+        assertTrue(Files.readString(file).equals("class Sample {}\n"), "失败时文件不应被修改");
+    }
+
+    @Test
+    void editFileFailsOnAmbiguousMatchWithoutReplaceAll(@TempDir Path tempDir) throws Exception {
+        Path file = tempDir.resolve("Sample.java");
+        Files.writeString(file, "a = 0;\na = 0;\n");
+        ToolRegistry registry = new ToolRegistry();
+        registry.setProjectPath(tempDir.toString());
+
+        String result = registry.executeTool("edit_file",
+                "{\"path\":\"Sample.java\",\"old_string\":\"a = 0;\",\"new_string\":\"a = 1;\"}");
+
+        assertTrue(result.contains("匹配到 2 处"), result);
+        assertTrue(Files.readString(file).equals("a = 0;\na = 0;\n"), "歧义匹配时文件不应被修改");
+    }
+
+    @Test
+    void editFileReplaceAllReplacesEveryMatch(@TempDir Path tempDir) throws Exception {
+        Path file = tempDir.resolve("Sample.java");
+        Files.writeString(file, "a = 0;\na = 0;\n");
+        ToolRegistry registry = new ToolRegistry();
+        registry.setProjectPath(tempDir.toString());
+
+        String result = registry.executeTool("edit_file",
+                "{\"path\":\"Sample.java\",\"old_string\":\"a = 0;\",\"new_string\":\"a = 1;\",\"replace_all\":true}");
+
+        assertTrue(result.contains("共替换 2 处"), result);
+        assertTrue(Files.readString(file).equals("a = 1;\na = 1;\n"));
+    }
+
+    @Test
+    void editFileRejectsPathOutsideProjectRoot(@TempDir Path tempDir) throws Exception {
+        ToolRegistry registry = new ToolRegistry();
+        registry.setProjectPath(tempDir.toString());
+
+        String result = registry.executeTool("edit_file",
+                "{\"path\":\"/etc/passwd\",\"old_string\":\"root\",\"new_string\":\"x\"}");
+
+        assertTrue(result.contains("🛡️ 策略拒绝") || result.contains("路径越界"), result);
+    }
+
+    @Test
+    void editFileRejectsIdenticalOldAndNew(@TempDir Path tempDir) throws Exception {
+        Path file = tempDir.resolve("Sample.java");
+        Files.writeString(file, "x = 1;\n");
+        ToolRegistry registry = new ToolRegistry();
+        registry.setProjectPath(tempDir.toString());
+
+        String result = registry.executeTool("edit_file",
+                "{\"path\":\"Sample.java\",\"old_string\":\"x = 1;\",\"new_string\":\"x = 1;\"}");
+
+        assertTrue(result.contains("相同，无需编辑"), result);
+    }
+
+    @Test
     void shouldGlobFilesInsideProject(@TempDir Path tempDir) throws Exception {
         Files.createDirectories(tempDir.resolve("src/main/java/com/example"));
         Files.writeString(tempDir.resolve("src/main/java/com/example/UserService.java"), "class UserService {}\n");

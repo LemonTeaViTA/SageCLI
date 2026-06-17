@@ -24,7 +24,7 @@ public class WechatPolicyDecider {
         if ("execute_command".equals(name)) {
             return commandAllowed(argumentsJson);
         }
-        if ("write_file".equals(name) || "create_project".equals(name)) {
+        if ("write_file".equals(name) || "edit_file".equals(name) || "create_project".equals(name)) {
             return WechatPolicyDecision.allow();
         }
         if ("revert_turn".equals(name)) {

@@ -63,6 +63,10 @@ public class ToolRegistry {
     private static final int MAX_PARALLEL_TOOLS = 4;
     private static final int MAX_COMMAND_OUTPUT_CHARS = 8_000;
     private static final int MAX_READ_FILE_LINES = 2_000;
+    // read_file 不带 offset/limit 时全文读取的字节上限。与 write 的 5MB 对称：
+    // 超限不报错，而是降级为只读前 MAX_READ_FILE_LINES 行并提示分页，避免一次性把超大文件
+    // （日志/数据集）灌进上下文导致 OOM 或 token 爆炸。
+    private static final long MAX_READ_FILE_BYTES = 5 * 1024 * 1024;
     private static final int MAX_GREP_RESULTS = 200;
     private static final int MAX_GREP_CONTEXT_LINES = 5;
     private static final long MAX_SEARCH_FILE_BYTES = 2 * 1024 * 1024;
@@ -73,7 +77,7 @@ public class ToolRegistry {
     // 5MB 对常规代码生成 / 文档撰写完全够用，超过即拒，避免磁盘灌满与误覆盖。
     private static final int MAX_WRITE_FILE_BYTES = 5 * 1024 * 1024;
     // 需要审计的内置工具（与 ApprovalPolicy 的 DANGEROUS_TOOLS 保持一致）；MCP 工具按前缀动态纳入审计。
-    private static final Set<String> AUDIT_TOOLS = Set.of("write_file", "execute_command", "create_project", "revert_turn");
+    private static final Set<String> AUDIT_TOOLS = Set.of("write_file", "edit_file", "execute_command", "create_project", "revert_turn");
     private final Map<String, Tool> tools = new ConcurrentHashMap<>();
     private final Map<String, McpRegisteredTool> mcpTools = new ConcurrentHashMap<>();
     private final long commandTimeoutSeconds;
@@ -281,6 +285,24 @@ public class ToolRegistry {
                 }
         ));
 
+        // edit_file 工具：str_replace 式局部编辑（精确字符串替换，不整文件覆写）
+        tools.put("edit_file", new Tool(
+                "edit_file",
+                "局部编辑文件：把文件中唯一出现的 old_string 替换为 new_string（仅限项目根之内）。"
+                        + "old_string 必须在文件中唯一匹配——若匹配 0 处会报\"未找到\"，匹配多处会要求补充上下文使其唯一，"
+                        + "或设 replace_all=true 替换全部。相比 write_file 整文件覆写，只动改的那一小段，更省 token、更不易改错。",
+                createParameters(
+                        new Param("path", "string", "文件路径（必须已存在）", true),
+                        new Param("old_string", "string", "要被替换的原文片段；需带足够上下文以在文件中唯一定位", true),
+                        new Param("new_string", "string", "替换后的新内容", true),
+                        new Param("replace_all", "boolean", "是否替换所有匹配，默认 false（要求唯一匹配）", false)
+                ),
+                args -> {
+                    Path safe = pathGuard.resolveSafe(args.get("path"));
+                    return editFileForTool(args.get("path"), safe, args);
+                }
+        ));
+
         // list_dir 工具
         tools.put("list_dir", new Tool(
                 "list_dir",
@@ -339,6 +361,20 @@ public class ToolRegistry {
         }
         boolean ranged = args.containsKey("offset") || args.containsKey("limit");
         if (!ranged) {
+            long size = Files.size(file);
+            if (size > MAX_READ_FILE_BYTES) {
+                // 超大文件不整段读：降级为只读前 MAX_READ_FILE_LINES 行并提示分页，避免 OOM / token 爆炸。
+                List<String> head = readFirstLines(file, MAX_READ_FILE_LINES);
+                StringBuilder sb = new StringBuilder();
+                sb.append("文件内容: ").append(file.getFileName())
+                        .append(" 共 ").append(size).append(" 字节，超过 ")
+                        .append(MAX_READ_FILE_BYTES / 1024 / 1024).append("MB 上限，已只读前 ")
+                        .append(head.size()).append(" 行；如需后续内容请用 offset/limit 分页读取。\n");
+                for (int i = 0; i < head.size(); i++) {
+                    sb.append(String.format("%5d | %s%n", i + 1, head.get(i)));
+                }
+                return sb.toString().trim();
+            }
             return "文件内容:\n" + Files.readString(file);
         }
 
@@ -363,6 +399,102 @@ public class ToolRegistry {
             sb.append("...(已截断，可用 offset=").append(to + 1).append(" 继续读取)");
         }
         return sb.toString().trim();
+    }
+
+    /** 流式读取文件前 maxLines 行，避免对超大文件 readAllLines 把全文载入内存。 */
+    private List<String> readFirstLines(Path file, int maxLines) throws IOException {
+        List<String> result = new ArrayList<>();
+        try (java.io.BufferedReader reader = Files.newBufferedReader(file, StandardCharsets.UTF_8)) {
+            String line;
+            while (result.size() < maxLines && (line = reader.readLine()) != null) {
+                result.add(line);
+            }
+        } catch (java.nio.charset.MalformedInputException e) {
+            // 二进制 / 非 UTF-8 文件：返回空，调用方提示已是字节级超限信息
+        }
+        return result;
+    }
+
+    /**
+     * str_replace 式局部编辑。精确性来自"唯一性强制"：
+     * old_string 在文件中必须恰好出现一次（replace_all=false），匹配 0 处或多处都报错让 LLM 自我纠正。
+     * 复用 write 路径的 observer（diff 渲染）和 LSP hook，不重复造轮子。
+     */
+    private String editFileForTool(String displayPath, Path file, Map<String, String> args) {
+        String oldString = args.get("old_string");
+        String newString = args.get("new_string") == null ? "" : args.get("new_string");
+        if (oldString == null || oldString.isEmpty()) {
+            return "编辑文件失败: old_string 不能为空";
+        }
+        if (oldString.equals(newString)) {
+            return "编辑文件失败: old_string 与 new_string 相同，无需编辑";
+        }
+        if (!Files.isRegularFile(file)) {
+            return "编辑文件失败: 文件不存在或不是普通文件: " + displayPath;
+        }
+
+        String content;
+        try {
+            content = Files.readString(file);
+        } catch (Exception e) {
+            return "编辑文件失败: 无法读取文件（可能是二进制或非 UTF-8）: " + e.getMessage();
+        }
+
+        int occurrences = countOccurrences(content, oldString);
+        if (occurrences == 0) {
+            return "编辑文件失败: 在文件中未找到 old_string，请先 read_file 确认原文后重试。";
+        }
+        boolean replaceAll = Boolean.parseBoolean(args.getOrDefault("replace_all", "false"));
+        if (occurrences > 1 && !replaceAll) {
+            return "编辑文件失败: old_string 在文件中匹配到 " + occurrences
+                    + " 处，无法唯一定位。请在 old_string 中补充更多上下文使其唯一，或设 replace_all=true 替换全部。";
+        }
+
+        String updated = replaceAll
+                ? content.replace(oldString, newString)
+                : replaceFirst(content, oldString, newString);
+
+        int updatedBytes = updated.getBytes(StandardCharsets.UTF_8).length;
+        if (updatedBytes > MAX_WRITE_FILE_BYTES) {
+            return "编辑文件失败: 编辑后内容 " + updatedBytes + " 字节超过 "
+                    + (MAX_WRITE_FILE_BYTES / 1024 / 1024) + "MB 上限";
+        }
+
+        try {
+            Files.writeString(file, updated);
+            try {
+                writeFileObserver.accept(displayPath, new String[]{content, updated});
+            } catch (Exception ignored) {
+                // observer 失败不影响编辑主路径
+            }
+            runPostEditLspHook(displayPath, file);
+            String scope = replaceAll ? ("，共替换 " + occurrences + " 处") : "";
+            return "文件已编辑: " + displayPath + scope;
+        } catch (Exception e) {
+            return "编辑文件失败: " + e.getMessage();
+        }
+    }
+
+    private static int countOccurrences(String haystack, String needle) {
+        if (needle.isEmpty()) {
+            return 0;
+        }
+        int count = 0;
+        int idx = 0;
+        while ((idx = haystack.indexOf(needle, idx)) != -1) {
+            count++;
+            idx += needle.length();
+        }
+        return count;
+    }
+
+    /** 只替换第一处匹配（String.replaceFirst 会把参数当正则，这里按字面量替换）。 */
+    private static String replaceFirst(String content, String oldString, String newString) {
+        int idx = content.indexOf(oldString);
+        if (idx == -1) {
+            return content;
+        }
+        return content.substring(0, idx) + newString + content.substring(idx + oldString.length());
     }
 
     private String globFiles(Map<String, String> args) {

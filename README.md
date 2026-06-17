@@ -59,11 +59,11 @@
 
 ### 安全纵深防御
 
-- **HITL 人工审批**（`/hitl on`）：危险操作（write_file / execute_command / create_project / revert_turn / 所有 mcp__ 工具）三级危险等级展示，支持批准 / 全部放行 / 拒绝 / 跳过 / 改参数后执行。
+- **HITL 人工审批**（`/hitl on`）：危险操作（write_file / edit_file / execute_command / create_project / revert_turn / 所有 mcp__ 工具）三级危险等级展示，支持批准 / 全部放行 / 拒绝 / 跳过 / 改参数后执行。
 - **路径围栏**：文件类工具强制限定项目根之内，拦截绝对路径外逃 / `..` 穿越 / 符号链接逃逸。
 - **命令快速拒绝**：HITL 之前的黑名单（`sudo` / `rm -rf` 全盘 / `mkfs` / `dd of=/dev` / fork bomb / `curl|sh` / `find /` / `chmod 777 /` / `shutdown`）。
 - **结构化审计**：危险工具调用按天写 JSONL 到 `~/.paicli/audit/`、脱敏凭证，`/audit [N]` 查看。
-- **资源上限**：`write_file` 5MB；`execute_command` 60 秒超时 + 8KB 输出截断。
+- **资源上限**：`write_file` 5MB；`read_file` 全文读取超 5MB 自动降级为前 2000 行 + 分页提示；`execute_command` 60 秒超时 + 8KB 输出截断。
 - 定位：HITL 之外的辅助层，不是沙箱、不提供进程隔离。
 
 ### 会话与快照
@@ -145,7 +145,7 @@ java -jar target/sagecli-1.0-SNAPSHOT.jar
 
 | 工具 | 说明 |
 |---|---|
-| `read_file` / `write_file` / `list_dir` | 文件读写与目录列举（限定项目根内） |
+| `read_file` / `write_file` / `edit_file` / `list_dir` | 文件读写、局部编辑与目录列举（限定项目根内） |
 | `glob_files` / `grep_code` | 按文件名 / 内容实时检索（grep 优先 ripgrep 加速） |
 | `execute_command` | 执行短时 Shell 命令（60 秒超时 + 黑名单拦截） |
 | `create_project` | 创建项目结构（java / python / node） |

@@ -568,7 +568,7 @@ public class Main {
                         String payload = command.payload();
                         if ("on".equals(payload)) {
                             hitlHandler.setEnabled(true);
-                            ui.println("🔒 HITL 审批已启用：write_file / execute_command / create_project 执行前将请求人工确认\n");
+                            ui.println("🔒 HITL 审批已启用：write_file / edit_file / execute_command / create_project 执行前将请求人工确认\n");
                         } else if ("off".equals(payload)) {
                             hitlHandler.setEnabled(false);
                             hitlHandler.clearApprovedAll();
@@ -1696,7 +1696,7 @@ public class Main {
         out.println("🛡️ 安全策略状态：");
         out.println("   项目根: " + reactAgent.getToolRegistry().getProjectPath());
         out.println("   危险工具: " + String.join(", ", ApprovalPolicy.getDangerousTools()) + "，以及所有 mcp__ 前缀工具");
-        out.println("   路径围栏: 强制限定在项目根之内（read_file / write_file / list_dir / create_project）");
+        out.println("   路径围栏: 强制限定在项目根之内（read_file / write_file / edit_file / list_dir / create_project）");
         out.println("   命令黑名单: sudo / rm -rf 全盘 / mkfs / dd of=/dev / fork bomb / curl|sh / find / / chmod 777 / / shutdown");
         out.println("   写入文件上限: 5MB");
         out.println("   命令执行上限: 60 秒，输出 8KB（截断）");

@@ -257,6 +257,7 @@ public final class PlainRenderer implements Renderer {
         return switch (toolName) {
             case "read_file" -> "📖 读取 " + count + " 个文件";
             case "write_file" -> "✏️ 写入 " + count + " 个文件";
+            case "edit_file" -> "✏️ 编辑 " + count + " 个文件";
             case "list_dir" -> "📂 列出 " + count + " 个目录";
             case "execute_command" -> "⚡ 执行 " + count + " 条命令";
             case "create_project" -> "🏗️ 创建 " + count + " 个项目";
@@ -282,7 +283,7 @@ public final class PlainRenderer implements Renderer {
         try {
             JsonNode node = JSON.readTree(argsJson);
             String key = switch (toolName) {
-                case "read_file", "write_file", "list_dir" -> "path";
+                case "read_file", "write_file", "edit_file", "list_dir" -> "path";
                 case "execute_command" -> "command";
                 case "create_project" -> "name";
                 case "search_code", "web_search" -> "query";
