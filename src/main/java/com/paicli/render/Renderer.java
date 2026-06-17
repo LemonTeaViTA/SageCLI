@@ -33,6 +33,31 @@ public interface Renderer extends AutoCloseable {
     default void beforeInput() {
     }
 
+    /**
+     * 当前终端宽度（列数）。用于按宽度排版用户消息块等。
+     * 默认读 COLUMNS 环境变量，无则回退 120；具体渲染器可覆盖为更精确的探测。
+     */
+    default int terminalColumns() {
+        String columns = System.getenv("COLUMNS");
+        if (columns != null && !columns.isBlank()) {
+            try {
+                return Math.max(40, Integer.parseInt(columns.trim()));
+            } catch (NumberFormatException ignored) {
+            }
+        }
+        return 120;
+    }
+
+    /**
+     * 追加一段助手正文 delta（流式）。默认 no-op；wechat 等需要按自然边界批量 flush 的渲染器覆盖它。
+     */
+    default void appendAssistantContentDelta(String delta) {
+    }
+
+    /** 助手正文输出结束，flush 残留内容。默认 no-op。 */
+    default void finishAssistantContent() {
+    }
+
     /** 用户输入结束后。inline renderer 用它恢复输入周边状态。 */
     default void afterInput() {
     }

@@ -40,6 +40,22 @@ public final class CommandGuard {
                     Pattern.compile("(?i)\\b(shutdown|reboot|halt|poweroff)\\b"))
     );
 
+    // 凭证路径拒绝规则（可整体关闭，见 check()）。只收"几乎不存在正当 shell 读取理由"的凭证路径，
+    // best-effort 非安全边界：能挡顺手 cat 私钥，但 base64/变量拼接/改名都能绕过。
+    // 故意不拦 /etc/passwd（世界可读、不含密码），避免误伤与制造安全错觉。
+    private static final List<DenyRule> SENSITIVE_PATH_RULES = List.of(
+            new DenyRule("禁止读取 SSH 私钥等 ~/.ssh 凭证",
+                    Pattern.compile("(?i)(\\.ssh/|\\bid_rsa\\b|\\bid_ed25519\\b|\\bid_ecdsa\\b|\\bid_dsa\\b|\\bauthorized_keys\\b)")),
+            new DenyRule("禁止读取 AWS / 云凭证目录",
+                    Pattern.compile("(?i)(\\.aws/|\\.config/gcloud/|\\.azure/|\\.kube/config)")),
+            new DenyRule("禁止读取 /etc/shadow 等系统密码影子文件",
+                    Pattern.compile("(?i)(/etc/shadow|/etc/gshadow|/etc/sudoers)")),
+            new DenyRule("禁止读取 .netrc / .pgpass / .git-credentials 等凭证文件",
+                    Pattern.compile("(?i)(\\.netrc\\b|\\.pgpass\\b|\\.npmrc\\b|\\.pypirc\\b|\\.git-credentials\\b)")),
+            new DenyRule("禁止通过 /proc 读取进程环境变量",
+                    Pattern.compile("(?i)/proc/[^/\\s]+/environ"))
+    );
+
     private CommandGuard() {
     }
 
@@ -59,7 +75,25 @@ public final class CommandGuard {
                 return rule.reason();
             }
         }
+        if (sensitivePathGuardEnabled()) {
+            for (DenyRule rule : SENSITIVE_PATH_RULES) {
+                if (rule.pattern().matcher(normalized).find()) {
+                    return rule.reason() + "（凭证路径保护，可用 -Dpaicli.command.guard.sensitive.paths=false 关闭）";
+                }
+            }
+        }
         return null;
+    }
+
+    private static boolean sensitivePathGuardEnabled() {
+        String raw = System.getProperty("paicli.command.guard.sensitive.paths");
+        if (raw == null || raw.isBlank()) {
+            raw = System.getenv("PAICLI_COMMAND_GUARD_SENSITIVE_PATHS");
+        }
+        if (raw == null || raw.isBlank()) {
+            return true; // 默认开
+        }
+        return !(raw.equalsIgnoreCase("false") || raw.equals("0") || raw.equalsIgnoreCase("off"));
     }
 
     private record DenyRule(String reason, Pattern pattern) {

@@ -90,4 +90,51 @@ class CommandGuardTest {
         assertNotNull(CommandGuard.check("echo $(rm -rf /)"));
         assertNotNull(CommandGuard.check("echo `sudo whoami`"));
     }
+
+    @Test
+    void rejectsSensitiveCredentialPaths() {
+        // SSH 私钥 / known_hosts
+        assertNotNull(CommandGuard.check("cat ~/.ssh/id_rsa"));
+        assertNotNull(CommandGuard.check("cat /home/ubuntu/.ssh/id_ed25519"));
+        assertNotNull(CommandGuard.check("cat ~/.ssh/authorized_keys"));
+        // 云凭证
+        assertNotNull(CommandGuard.check("cat ~/.aws/credentials"));
+        assertNotNull(CommandGuard.check("cat ~/.kube/config"));
+        // 系统影子文件
+        assertNotNull(CommandGuard.check("cat /etc/shadow"));
+        assertNotNull(CommandGuard.check("sudo cat /etc/sudoers")); // 也会先撞 sudo 规则，总之被拒
+        // 凭证文件
+        assertNotNull(CommandGuard.check("cat ~/.netrc"));
+        assertNotNull(CommandGuard.check("cat .git-credentials"));
+        // 通过 /proc 偷环境变量
+        assertNotNull(CommandGuard.check("cat /proc/1234/environ"));
+    }
+
+    @Test
+    void doesNotBlockWorldReadableNonSecretFiles() {
+        // /etc/passwd 故意不拦：世界可读、不含密码。拦它属于"阻止一切项目外读取"，
+        // 而那靠命令名单做不到，不如不假装（见 CommandGuard 类注释）。
+        assertNull(CommandGuard.check("cat /etc/passwd"));
+        assertNull(CommandGuard.check("cat /etc/hosts"));
+        assertNull(CommandGuard.check("cat README.md"));
+    }
+
+    @Test
+    void sensitivePathGuardCanBeDisabled() {
+        String key = "paicli.command.guard.sensitive.paths";
+        String original = System.getProperty(key);
+        try {
+            System.setProperty(key, "false");
+            assertNull(CommandGuard.check("cat ~/.ssh/id_rsa"),
+                    "关闭凭证路径保护后应放行（破坏性规则仍生效）");
+            // 破坏性规则不受该开关影响
+            assertNotNull(CommandGuard.check("rm -rf /"));
+        } finally {
+            if (original == null) {
+                System.clearProperty(key);
+            } else {
+                System.setProperty(key, original);
+            }
+        }
+    }
 }

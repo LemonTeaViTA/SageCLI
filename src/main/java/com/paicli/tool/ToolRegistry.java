@@ -17,6 +17,7 @@ import com.paicli.rag.SearchResultFormatter;
 import com.paicli.rag.VectorStore;
 import com.paicli.policy.AuditLog;
 import com.paicli.policy.CommandGuard;
+import com.paicli.policy.EnvironmentSanitizer;
 import com.paicli.policy.PathGuard;
 import com.paicli.policy.PolicyException;
 import com.paicli.runtime.CancellationContext;
@@ -1398,6 +1399,9 @@ public class ToolRegistry {
         try {
             ProcessBuilder pb = new ProcessBuilder("bash", "-c", normalized);
             pb.directory(new File(projectPath));
+            // 子进程环境脱敏：默认删掉继承下来的凭证类变量，避免 LLM 用 env/printenv 偷走 API key。
+            // 这是确定性边界（删了就读不到），区别于 CommandGuard 的 best-effort 黑名单。
+            EnvironmentSanitizer.sanitize(pb.environment());
             pb.redirectErrorStream(true);
             process = pb.start();
 
