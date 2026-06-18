@@ -441,6 +441,17 @@ public class ToolRegistry {
         }
 
         int occurrences = countOccurrences(content, oldString);
+        // 弯引号归一化匹配（参考 Claude Code FileEditTool.findActualString）：
+        // 文件里若是排版弯引号 “ ” ‘ ’ 而模型给的是直引号 " '，精确匹配会失败。
+        // 先精确匹配；失败就归一化两边弯引号再找，命中后回到原文取真实子串（保留弯引号）。
+        String actualOld = oldString;
+        if (occurrences == 0) {
+            String resolved = findActualString(content, oldString);
+            if (resolved != null) {
+                actualOld = resolved;
+                occurrences = countOccurrences(content, actualOld);
+            }
+        }
         if (occurrences == 0) {
             return "编辑文件失败: 在文件中未找到 old_string，请先 read_file 确认原文后重试。";
         }
@@ -450,9 +461,11 @@ public class ToolRegistry {
                     + " 处，无法唯一定位。请在 old_string 中补充更多上下文使其唯一，或设 replace_all=true 替换全部。";
         }
 
+        // 若经弯引号归一化才匹配上，把 new_string 的直引号按文件原本风格还原，保持排版一致。
+        String actualNew = preserveQuoteStyle(oldString, actualOld, newString);
         String updated = replaceAll
-                ? content.replace(oldString, newString)
-                : replaceFirst(content, oldString, newString);
+                ? content.replace(actualOld, actualNew)
+                : replaceFirst(content, actualOld, actualNew);
 
         int updatedBytes = updated.getBytes(StandardCharsets.UTF_8).length;
         if (updatedBytes > MAX_WRITE_FILE_BYTES) {
@@ -495,6 +508,94 @@ public class ToolRegistry {
             return content;
         }
         return content.substring(0, idx) + newString + content.substring(idx + oldString.length());
+    }
+
+    // 排版弯引号常量（模型输出不了弯引号，文件里却常有，尤其中文/Markdown 场景）。
+    private static final char LEFT_SINGLE_CURLY = '‘';   // ‘
+    private static final char RIGHT_SINGLE_CURLY = '’';  // ’
+    private static final char LEFT_DOUBLE_CURLY = '“';   // “
+    private static final char RIGHT_DOUBLE_CURLY = '”';  // ”
+
+    private static String normalizeQuotes(String s) {
+        return s.replace(LEFT_SINGLE_CURLY, '\'')
+                .replace(RIGHT_SINGLE_CURLY, '\'')
+                .replace(LEFT_DOUBLE_CURLY, '"')
+                .replace(RIGHT_DOUBLE_CURLY, '"');
+    }
+
+    /**
+     * 在文件内容里找到与 searchString 匹配的真实子串，兼容弯引号差异。
+     * 先精确匹配；失败则归一化两边弯引号再找，命中后回到原文取真实子串（保留弯引号）。
+     * 返回 null 表示确实找不到。参考 Claude Code FileEditTool.findActualString。
+     */
+    private static String findActualString(String fileContent, String searchString) {
+        if (fileContent.contains(searchString)) {
+            return searchString;
+        }
+        String normFile = normalizeQuotes(fileContent);
+        String normSearch = normalizeQuotes(searchString);
+        int idx = normFile.indexOf(normSearch);
+        if (idx == -1) {
+            return null;
+        }
+        // 归一化不改变长度（弯引号与直引号都是单字符），可直接用原文同位置同长度子串。
+        return fileContent.substring(idx, idx + searchString.length());
+    }
+
+    /**
+     * 当 old_string 经弯引号归一化才匹配上时，把 new_string 里的直引号按文件原本的弯引号风格还原，
+     * 使编辑保留排版一致性。用简单的开/闭启发式：引号前是空白/起始/开括号视为开引号，否则为闭引号。
+     * 参考 Claude Code FileEditTool.preserveQuoteStyle。
+     */
+    private static String preserveQuoteStyle(String oldString, String actualOld, String newString) {
+        if (oldString.equals(actualOld)) {
+            return newString; // 未发生归一化
+        }
+        boolean hasDouble = actualOld.indexOf(LEFT_DOUBLE_CURLY) >= 0 || actualOld.indexOf(RIGHT_DOUBLE_CURLY) >= 0;
+        boolean hasSingle = actualOld.indexOf(LEFT_SINGLE_CURLY) >= 0 || actualOld.indexOf(RIGHT_SINGLE_CURLY) >= 0;
+        if (!hasDouble && !hasSingle) {
+            return newString;
+        }
+        String result = newString;
+        if (hasDouble) {
+            result = applyCurlyQuotes(result, '"', LEFT_DOUBLE_CURLY, RIGHT_DOUBLE_CURLY, false);
+        }
+        if (hasSingle) {
+            result = applyCurlyQuotes(result, '\'', LEFT_SINGLE_CURLY, RIGHT_SINGLE_CURLY, true);
+        }
+        return result;
+    }
+
+    private static boolean isOpeningContext(char[] chars, int index) {
+        if (index == 0) {
+            return true;
+        }
+        char prev = chars[index - 1];
+        return prev == ' ' || prev == '\t' || prev == '\n' || prev == '\r'
+                || prev == '(' || prev == '[' || prev == '{'
+                || prev == '—' || prev == '–'; // em / en dash
+    }
+
+    private static String applyCurlyQuotes(String s, char straight, char left, char right, boolean isSingle) {
+        char[] chars = s.toCharArray();
+        StringBuilder out = new StringBuilder(chars.length);
+        for (int i = 0; i < chars.length; i++) {
+            if (chars[i] != straight) {
+                out.append(chars[i]);
+                continue;
+            }
+            if (isSingle) {
+                // 缩写里的撇号（don't / it's）不是引号：两侧都是字母时用右单弯引号
+                boolean prevLetter = i > 0 && Character.isLetter(chars[i - 1]);
+                boolean nextLetter = i < chars.length - 1 && Character.isLetter(chars[i + 1]);
+                if (prevLetter && nextLetter) {
+                    out.append(right);
+                    continue;
+                }
+            }
+            out.append(isOpeningContext(chars, i) ? left : right);
+        }
+        return out.toString();
     }
 
     private String globFiles(Map<String, String> args) {

@@ -178,6 +178,37 @@ class ToolRegistryTest {
     }
 
     @Test
+    void editFileMatchesCurlyQuotesWithStraightOldString(@TempDir Path tempDir) throws Exception {
+        // 文件用排版弯引号，模型给的是直引号——精确匹配会失败，弯引号归一化后应能命中。
+        Path file = tempDir.resolve("doc.md");
+        Files.writeString(file, "说明：“重要提示”在这里。\n");
+        ToolRegistry registry = new ToolRegistry();
+        registry.setProjectPath(tempDir.toString());
+
+        String result = registry.executeTool("edit_file",
+                "{\"path\":\"doc.md\",\"old_string\":\"\\\"重要提示\\\"\",\"new_string\":\"\\\"关键提示\\\"\"}");
+
+        assertTrue(result.contains("文件已编辑"), result);
+        String after = Files.readString(file);
+        // new_string 的直引号应按文件原风格还原为弯引号
+        assertTrue(after.contains("“关键提示”"), "替换后应保留弯引号风格: " + after);
+        assertTrue(!after.contains("重要提示"));
+    }
+
+    @Test
+    void editFileStillFailsWhenTrulyNotFound(@TempDir Path tempDir) throws Exception {
+        Path file = tempDir.resolve("doc.md");
+        Files.writeString(file, "纯直引号 \"abc\" 内容\n");
+        ToolRegistry registry = new ToolRegistry();
+        registry.setProjectPath(tempDir.toString());
+
+        String result = registry.executeTool("edit_file",
+                "{\"path\":\"doc.md\",\"old_string\":\"这段内容文件里没有\",\"new_string\":\"x\"}");
+
+        assertTrue(result.contains("未找到 old_string"), result);
+    }
+
+    @Test
     void shouldGlobFilesInsideProject(@TempDir Path tempDir) throws Exception {
         Files.createDirectories(tempDir.resolve("src/main/java/com/example"));
         Files.writeString(tempDir.resolve("src/main/java/com/example/UserService.java"), "class UserService {}\n");
