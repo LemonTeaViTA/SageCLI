@@ -51,6 +51,9 @@ public class SubAgent {
     private SkillContextBuffer skillContextBuffer;
     private final ConversationHistoryCompactor historyCompactor;
     private final PromptAssembler promptAssembler = PromptAssembler.createDefault();
+    // 工具白名单：null=用全部工具；非 null=只暴露并允许执行这些工具。
+    // 用途：dispatch_agent 派生的检索子 agent 只给只读检索工具，且不含 dispatch_agent 本身（防递归）。
+    private java.util.Set<String> allowedToolNames;
 
     public SubAgent(String name, AgentRole role, LlmClient llmClient, ToolRegistry toolRegistry) {
         this.name = name;
@@ -74,6 +77,14 @@ public class SubAgent {
 
     public void setSkillContextBuffer(SkillContextBuffer skillContextBuffer) {
         this.skillContextBuffer = skillContextBuffer;
+    }
+
+    /**
+     * 限制本子 agent 可见/可用的工具集（白名单）。传 null 恢复为全部工具。
+     * 过滤同时作用于"暴露给 LLM 的工具定义"和"实际执行入口"，双重保险。
+     */
+    public void setAllowedToolNames(java.util.Set<String> allowedToolNames) {
+        this.allowedToolNames = allowedToolNames == null ? null : java.util.Set.copyOf(allowedToolNames);
     }
 
     /**
@@ -193,7 +204,7 @@ public class SubAgent {
             try {
                 LlmClient.ChatResponse response = llmClient.chat(
                         conversationHistory,
-                        shouldUseTools() ? toolRegistry.getToolDefinitions() : null,
+                        shouldUseTools() ? toolDefinitionsForRole() : null,
                         streamRenderer
                 );
                 LlmTraceLogger.logReasoning(log,
@@ -304,6 +315,15 @@ public class SubAgent {
         return role == AgentRole.WORKER;
     }
 
+    /** 暴露给 LLM 的工具定义；若设了白名单则只保留白名单内的工具。 */
+    private List<LlmClient.Tool> toolDefinitionsForRole() {
+        List<LlmClient.Tool> all = toolRegistry.getToolDefinitions();
+        if (allowedToolNames == null) {
+            return all;
+        }
+        return all.stream().filter(t -> allowedToolNames.contains(t.name())).toList();
+    }
+
     private void injectPendingLspDiagnostics(PrintStream out) {
         LspDiagnosticReport report = toolRegistry.flushPendingLspDiagnostics();
         if (report == null || report.isEmpty()) {
@@ -316,9 +336,18 @@ public class SubAgent {
 
     private List<ToolExecutionResult> executeToolCalls(List<LlmClient.ToolCall> toolCalls) {
         List<ToolInvocation> invocations = new ArrayList<>();
+        List<ToolExecutionResult> blocked = new ArrayList<>();
         for (LlmClient.ToolCall toolCall : toolCalls) {
             String toolName = toolCall.function().name();
             String toolArgs = toolCall.function().arguments();
+            // 白名单兜底：LLM 不该看到白名单外的工具，万一调了（越权/幻觉）直接拒绝，不进 registry。
+            if (allowedToolNames != null && !allowedToolNames.contains(toolName)) {
+                log.warn("[{}] blocked disallowed tool call: {}", name, toolName);
+                blocked.add(ToolRegistry.blockedToolResult(toolCall.id(), toolName,
+                        "工具 " + toolName + " 不在本检索子 agent 的可用工具范围内，已拒绝。"
+                                + "本子 agent 仅用于只读检索，请用 read_file/grep_code/glob_files/list_dir 等检索工具。"));
+                continue;
+            }
             log.info("[{}] scheduling tool: {}", name, toolName);
             log.debug("[{}] tool args [{}]: {}", name, toolName, toolArgs);
             invocations.add(new ToolInvocation(toolCall.id(), toolName, toolArgs));
@@ -327,7 +356,12 @@ public class SubAgent {
         if (invocations.size() > 1) {
             log.info("[{}] executing {} tool calls in parallel", name, invocations.size());
         }
-        return toolRegistry.executeTools(invocations);
+        if (invocations.isEmpty()) {
+            return blocked;
+        }
+        List<ToolExecutionResult> results = new ArrayList<>(toolRegistry.executeTools(invocations));
+        results.addAll(blocked);
+        return results;
     }
 
     private void appendImageToolMessages(List<ToolExecutionResult> toolResults) {

@@ -164,6 +164,7 @@ public class PlanExecuteAgent {
         this.toolRegistry.setContextProfile(this.memoryManager.getContextProfile());
         this.memoryManager.setProjectPath(this.toolRegistry.getProjectPath());
         this.toolRegistry.setScopedMemorySaver(this.memoryManager::storeFact);
+        this.toolRegistry.setAgentDispatchLlmClient(llmClient);
     }
 
     private static PrintStream deferredSystemOut() {

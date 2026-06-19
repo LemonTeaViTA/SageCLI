@@ -57,6 +57,7 @@ import java.util.regex.PatternSyntaxException;
  * 工具注册表 - 管理所有可用工具
  */
 public class ToolRegistry {
+    private static final org.slf4j.Logger log = org.slf4j.LoggerFactory.getLogger(ToolRegistry.class);
     private static final ObjectMapper mapper = new ObjectMapper();
     private static final int DEFAULT_COMMAND_TIMEOUT_SECONDS = 60;
     private static final int DEFAULT_TOOL_BATCH_TIMEOUT_SECONDS = 90;
@@ -104,6 +105,14 @@ public class ToolRegistry {
     private SnapshotService snapshotService = SnapshotService.forProject(Path.of(projectPath));
     private boolean customSnapshotService;
 
+    // dispatch_agent 用：派生子 agent 需要 LlmClient。ToolRegistry 本身不持有，由 Agent 构造时注入。
+    private com.paicli.llm.LlmClient agentDispatchLlmClient;
+    // 防递归深度计数：进入 dispatch_agent +1，退出 -1；>1 直接拒绝，防子 agent 再派孙 agent。
+    private final java.util.concurrent.atomic.AtomicInteger agentDispatchDepth = new java.util.concurrent.atomic.AtomicInteger();
+    // 检索子 agent 的只读工具白名单：只给检索类，不给写/执行/快照，更不含 dispatch_agent 本身（防递归主闸）。
+    private static final Set<String> AGENT_INVESTIGATION_TOOLS = Set.of(
+            "read_file", "list_dir", "glob_files", "grep_code", "search_code");
+
     // 读取台账（会话级，随 ToolRegistry 实例生命周期）：key=规范化绝对路径，value=最近一次读取的快照。
     // 支撑两件事：① read 去重（同文件同区间、mtime 未变 → 回桩不重发内容，省 token）；
     //            ② edit 失效检测（编辑前比对 mtime，变了就要求重读，防"静默改错位置"）。
@@ -138,6 +147,15 @@ public class ToolRegistry {
         registerMemoryTools();
         registerSkillTools();
         registerSnapshotTools();
+        registerAgentTools();
+    }
+
+    /**
+     * 注入派生子 agent 所需的 LlmClient（dispatch_agent 工具用）。
+     * 未注入时 dispatch_agent 会返回友好错误而非崩溃。由 Agent / PlanExecuteAgent / AgentOrchestrator 构造时接入。
+     */
+    public void setAgentDispatchLlmClient(com.paicli.llm.LlmClient agentDispatchLlmClient) {
+        this.agentDispatchLlmClient = agentDispatchLlmClient;
     }
 
     /**
@@ -1231,6 +1249,64 @@ public class ToolRegistry {
         ));
     }
 
+    private void registerAgentTools() {
+        tools.put("dispatch_agent", new Tool(
+                "dispatch_agent",
+                "派生一个只读检索子 agent 来完成开放式、需多轮翻多文件的搜索任务，只把提炼后的结论回传——"
+                        + "中间翻过的大量文件内容不会进入你的上下文（省 token、不干扰主线）。"
+                        + "适用：\"在整个项目里找 X 在哪/怎么实现的\"这类需要多轮 grep+read 的探索。"
+                        + "不要用于：已知单个文件路径（直接 read_file）、找某个符号定义（直接 grep_code）、"
+                        + "只在 2-3 个文件内查看（直接 read_file）。子 agent 只能读、不能改���件。",
+                createParameters(
+                        new Param("description", "string", "任务的 3-5 字概述", true),
+                        new Param("prompt", "string", "给子 agent 的完整检索指令：要找什么、判断标准、希望回传什么结论", true)
+                ),
+                this::dispatchInvestigationAgent
+        ));
+    }
+
+    /**
+     * dispatch_agent 工具实现：派生一个只读检索子 agent，跑完只回传它的最终结论文本。
+     * 防递归两道闸：① 子 agent 工具白名单不含 dispatch_agent（LLM 看不到）；② 深度计数 >1 拒绝。
+     */
+    private String dispatchInvestigationAgent(Map<String, String> args) {
+        if (agentDispatchLlmClient == null) {
+            return "检索子 agent 不可用：未注入 LlmClient。请在主程序构造时调用 setAgentDispatchLlmClient。";
+        }
+        String prompt = args.get("prompt");
+        if (prompt == null || prompt.isBlank()) {
+            return "检索子 agent 启动失败：prompt 不能为空。";
+        }
+        String description = args.getOrDefault("description", "检索任务");
+        // 深度兜底闸：理论上白名单已挡住，这里防任何绕过白名单的直接调用造成无限下放。
+        if (agentDispatchDepth.get() > 0) {
+            return "拒绝嵌套派生：检索子 agent 内不能再派生子 agent。请在当前层完成检索。";
+        }
+        agentDispatchDepth.incrementAndGet();
+        try {
+            com.paicli.agent.SubAgent investigator = new com.paicli.agent.SubAgent(
+                    "investigator", com.paicli.agent.AgentRole.WORKER, agentDispatchLlmClient, this);
+            investigator.setAllowedToolNames(AGENT_INVESTIGATION_TOOLS);
+            String task = "你是一个**只读检索子 agent**。任务：" + description + "\n\n"
+                    + "具体要求：\n" + prompt + "\n\n"
+                    + "工作方式：用 grep_code/glob_files/read_file/list_dir/search_code 多轮检索定位答案。\n"
+                    + "回传约束：只返回**精炼结论**——关键发现 + `文件路径:行号` 引用 + 必要的简短代码片段。"
+                    + "**不要**回贴整段文件内容，不要复述检索过程。你的最终回复就是要交给主 agent 的答案。";
+            com.paicli.agent.AgentMessage result = investigator.execute(
+                    com.paicli.agent.AgentMessage.task("dispatch_agent", task));
+            String content = result.content();
+            if (result.type() == com.paicli.agent.AgentMessage.Type.ERROR) {
+                return "检索子 agent 执行出错：" + content;
+            }
+            return "【检索子 agent 结论 · " + description + "】\n" + content;
+        } catch (Exception e) {
+            log.error("dispatch_agent failed", e);
+            return "检索子 agent 异常：" + e.getMessage();
+        } finally {
+            agentDispatchDepth.decrementAndGet();
+        }
+    }
+
     private static int parseInt(String value, int fallback) {
         if (value == null || value.isBlank()) return fallback;
         try {
@@ -1861,6 +1937,14 @@ public class ToolRegistry {
         public boolean hasImageParts() {
             return imageParts != null && !imageParts.isEmpty();
         }
+    }
+
+    /**
+     * 构造一条"工具被拒绝"的结果（标记 failed）。供 SubAgent 白名单兜底等场景使用：
+     * 某个工具调用未真正执行（越权/不可用），但仍需回一条带原 tool_call id 的结果维持消息配对。
+     */
+    public static ToolExecutionResult blockedToolResult(String id, String toolName, String message) {
+        return new ToolExecutionResult(id, toolName, "", message, 0, false, List.of(), true);
     }
 
     public interface ToolExecutor {

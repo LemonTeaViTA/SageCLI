@@ -69,6 +69,7 @@ public class Agent {
         this.toolRegistry.setContextProfile(memoryManager.getContextProfile());
         this.memoryManager.setProjectPath(this.toolRegistry.getProjectPath());
         this.toolRegistry.setScopedMemorySaver(memoryManager::storeFact);
+        this.toolRegistry.setAgentDispatchLlmClient(llmClient);
         conversationHistory.add(LlmClient.Message.system(buildSystemPrompt()));
     }
 
@@ -77,6 +78,7 @@ public class Agent {
         this.memoryManager.setLlmClient(llmClient);
         this.historyCompactor.setLlmClient(llmClient);
         this.toolRegistry.setContextProfile(memoryManager.getContextProfile());
+        this.toolRegistry.setAgentDispatchLlmClient(llmClient);
     }
 
     public void setExternalContextSupplier(Supplier<String> externalContextSupplier) {
