@@ -64,10 +64,13 @@ public class ToolRegistry {
     private static final int MAX_COMMAND_OUTPUT_CHARS = 8_000;
     private static final int MAX_READ_FILE_LINES = 2_000;
     // read_file 不带 offset/limit 时全文读取的字节上限。与 write 的 5MB 对称：
-    // 超限不报错，而是降级为只读前 MAX_READ_FILE_LINES 行并提示分页，避免一次性把超大文件
-    // （日志/数据集）灌进上下文导致 OOM 或 token 爆炸。
+    // 超限直接抛错（提示用 offset/limit 或 grep_code），不再降级读前 N 行——
+    // 截断塞进上下文的"文件头部"会随历史逐轮重发烧 token，且大概率不是模型要的内容。
     private static final long MAX_READ_FILE_BYTES = 5 * 1024 * 1024;
     private static final int MAX_GREP_RESULTS = 200;
+    // glob 候选收集上限：先收集全部命中（受围栏 + 排除目录限制），再按 mtime 排序、截到 max_results。
+    // 设上限防 `**/*` 这类模式在超大树上无界占内存；超过则只在已收集的候选里排序。
+    private static final int MAX_GLOB_SCAN = 5_000;
     private static final int MAX_GREP_CONTEXT_LINES = 5;
     private static final long MAX_SEARCH_FILE_BYTES = 2 * 1024 * 1024;
     private static final Set<String> SEARCH_EXCLUDED_DIRS = Set.of(
@@ -100,6 +103,19 @@ public class ToolRegistry {
     private LspManager lspManager = new LspManager(projectPath);
     private SnapshotService snapshotService = SnapshotService.forProject(Path.of(projectPath));
     private boolean customSnapshotService;
+
+    // 读取台账（会话级，随 ToolRegistry 实例生命周期）：key=规范化绝对路径，value=最近一次读取的快照。
+    // 支撑两件事：① read 去重（同文件同区间、mtime 未变 → 回桩不重发内容，省 token）；
+    //            ② edit 失效检测（编辑前比对 mtime，变了就要求重读，防"静默改错位置"）。
+    // 用 ConcurrentHashMap：工具可能并行执行（见 MAX_PARALLEL_TOOLS）。
+    private final Map<String, ReadRecord> readFileState = new ConcurrentHashMap<>();
+    // 单调递增的读取序号；去重只在"最近 DEDUP_WINDOW 次读取内"生效（保守策略）。
+    // 理由：上下文被压缩后早轮内容可能已不在窗口里，台账却还记着"读过"——限定近窗 + 桩里给逃生口，避免模型看不到内容又无法重读。
+    private final java.util.concurrent.atomic.AtomicLong readSeq = new java.util.concurrent.atomic.AtomicLong();
+    private static final long DEDUP_WINDOW = 8;
+
+    /** 一次读取的快照：mtime（毫秒）、读取的区间（offset/limit，整段读为 null）、当时的读取序号。 */
+    private record ReadRecord(long mtimeMs, Integer offset, Integer limit, long seq) {}
 
     public ToolRegistry() {
         this(DEFAULT_COMMAND_TIMEOUT_SECONDS, DEFAULT_TOOL_BATCH_TIMEOUT_SECONDS);
@@ -272,6 +288,9 @@ public class ToolRegistry {
                             Files.createDirectories(parent);
                         }
                         Files.writeString(safe, content);
+                        // 刷新台账：write_file 是模型自己写的，它已知最新内容；记为整段读，
+                        // 这样紧接着的 edit_file 不会误判"已被外部修改"。
+                        recordRead(safe, null, null);
                         try {
                             writeFileObserver.accept(path, new String[]{before, content});
                         } catch (Exception ignored) {
@@ -363,23 +382,29 @@ public class ToolRegistry {
         if (!ranged) {
             long size = Files.size(file);
             if (size > MAX_READ_FILE_BYTES) {
-                // 超大文件不整段读：降级为只读前 MAX_READ_FILE_LINES 行并提示分页，避免 OOM / token 爆炸。
-                List<String> head = readFirstLines(file, MAX_READ_FILE_LINES);
-                StringBuilder sb = new StringBuilder();
-                sb.append("文件内容: ").append(file.getFileName())
-                        .append(" 共 ").append(size).append(" 字节，超过 ")
-                        .append(MAX_READ_FILE_BYTES / 1024 / 1024).append("MB 上限，已只读前 ")
-                        .append(head.size()).append(" 行；如需后续内容请用 offset/limit 分页读取。\n");
-                for (int i = 0; i < head.size(); i++) {
-                    sb.append(String.format("%5d | %s%n", i + 1, head.get(i)));
-                }
-                return sb.toString().trim();
+                // 超大文件不整段读、也不降级读前 N 行：直接抛错把决策权还给模型。
+                // 理由（对照 Claude Code FileReadTool/limits.ts 实测 #21841）：tool_result 会随对话历史
+                // 逐轮重发，截断塞进去的"文件头部"大概率不是模型要的内容，却被反复重发并烧 token，
+                // 模型还得再精读一次；而一条短错误（~百字节）把"如何精确取"交回模型，一步走对。
+                return "读取文件失败: " + file.getFileName() + " 共 " + size + " 字节，超过 "
+                        + (MAX_READ_FILE_BYTES / 1024 / 1024) + "MB 上限，未读取。\n"
+                        + "请改用 offset/limit 分页读取指定区间，或用 grep_code 检索关键内容定位行号后再精读。";
             }
-            return "文件内容:\n" + Files.readString(file);
+            String dedup = dedupStubOrNull(file, null, null);
+            if (dedup != null) {
+                return dedup;
+            }
+            String content = "文件内容:\n" + Files.readString(file);
+            recordRead(file, null, null);
+            return content;
         }
 
         int offset = Math.max(1, parseInt(args.get("offset"), 1));
         int limit = Math.max(1, Math.min(parseInt(args.get("limit"), 200), MAX_READ_FILE_LINES));
+        String dedup = dedupStubOrNull(file, offset, limit);
+        if (dedup != null) {
+            return dedup;
+        }
         List<String> lines = Files.readAllLines(file, StandardCharsets.UTF_8);
         int total = lines.size();
         if (offset > total) {
@@ -398,21 +423,55 @@ public class ToolRegistry {
         if (to < total) {
             sb.append("...(已截断，可用 offset=").append(to + 1).append(" 继续读取)");
         }
+        recordRead(file, offset, limit);
         return sb.toString().trim();
     }
 
-    /** 流式读取文件前 maxLines 行，避免对超大文件 readAllLines 把全文载入内存。 */
-    private List<String> readFirstLines(Path file, int maxLines) throws IOException {
-        List<String> result = new ArrayList<>();
-        try (java.io.BufferedReader reader = Files.newBufferedReader(file, StandardCharsets.UTF_8)) {
-            String line;
-            while (result.size() < maxLines && (line = reader.readLine()) != null) {
-                result.add(line);
-            }
-        } catch (java.nio.charset.MalformedInputException e) {
-            // 二进制 / 非 UTF-8 文件：返回空，调用方提示已是字节级超限信息
+    /**
+     * 读去重：若同一文件、同一区间在最近 DEDUP_WINDOW 次读取内已读过、且 mtime 未变，
+     * 返回一条短桩而不重发文件内容（省 token）。否则返回 null 走正常读取。
+     * 保守点：① 超出近窗就重发（防上下文压缩后内容已不在）；② mtime 变了必重读；③ 桩里给逃生口。
+     */
+    private String dedupStubOrNull(Path file, Integer offset, Integer limit) {
+        ReadRecord rec = readFileState.get(canonicalKey(file));
+        if (rec == null
+                || !Objects.equals(rec.offset(), offset)
+                || !Objects.equals(rec.limit(), limit)
+                || readSeq.get() - rec.seq() > DEDUP_WINDOW) {
+            return null;
         }
-        return result;
+        long mtime;
+        try {
+            mtime = Files.getLastModifiedTime(file).toMillis();
+        } catch (Exception e) {
+            return null;
+        }
+        if (mtime != rec.mtimeMs()) {
+            return null;
+        }
+        return "文件未变化: " + file.getFileName()
+                + "（自上次读取以来未修改，内容同前，已省略以省 token）。"
+                + "如该内容已不在上下文，可换 offset/limit 区间或在多轮后重读。";
+    }
+
+    /** 记录一次成功读取到台账（mtime + 区间 + 递增序号）。stat 失败则不记录，留待下次正常读。 */
+    private void recordRead(Path file, Integer offset, Integer limit) {
+        long mtime;
+        try {
+            mtime = Files.getLastModifiedTime(file).toMillis();
+        } catch (Exception e) {
+            return;
+        }
+        readFileState.put(canonicalKey(file), new ReadRecord(mtime, offset, limit, readSeq.incrementAndGet()));
+    }
+
+    /** 台账 key：规范化绝对路径（解析符号链接），保证不同写法指向同一文件时命中同一条记录。 */
+    private String canonicalKey(Path file) {
+        try {
+            return file.toRealPath().toString();
+        } catch (Exception e) {
+            return file.toAbsolutePath().normalize().toString();
+        }
     }
 
     /**
@@ -438,6 +497,22 @@ public class ToolRegistry {
             content = Files.readString(file);
         } catch (Exception e) {
             return "编辑文件失败: 无法读取文件（可能是二进制或非 UTF-8）: " + e.getMessage();
+        }
+
+        // 失效检测：若该文件被 read_file 读过、但之后 mtime 变了（外部进程/用户改动），
+        // 模型手里的 old_string 可能已是旧内容，盲目替换有"改错位置"风险——要求重读。
+        // 保守：只在"读过且确实变了"时拦；从未读过的文件不拦（不破坏 SageCLI 既有的免读直编行为）。
+        ReadRecord prior = readFileState.get(canonicalKey(file));
+        if (prior != null) {
+            try {
+                if (Files.getLastModifiedTime(file).toMillis() != prior.mtimeMs()) {
+                    return "编辑文件失败: " + displayPath
+                            + " 自你上次 read_file 之后已被修改，当前内容可能与你掌握的不一致。"
+                            + "请先重新 read_file 确认最新内容，再基于新内容编辑。";
+                }
+            } catch (Exception ignored) {
+                // stat 失败不阻断编辑主路径
+            }
         }
 
         int occurrences = countOccurrences(content, oldString);
@@ -475,6 +550,9 @@ public class ToolRegistry {
 
         try {
             Files.writeString(file, updated);
+            // 编辑成功后刷新台账 mtime：把"模型已知的最新内容"对齐到这次写入，
+            // 否则连续两次 edit 时第二次会误判"已被修改"。沿用 prior 的区间信息（无则记整段）。
+            recordRead(file, prior == null ? null : prior.offset(), prior == null ? null : prior.limit());
             try {
                 writeFileObserver.accept(displayPath, new String[]{content, updated});
             } catch (Exception ignored) {
@@ -608,35 +686,65 @@ public class ToolRegistry {
         Path projectRoot = pathGuard.getRootPath();
         PathMatcher matcher = projectRoot.getFileSystem().getPathMatcher("glob:" + normalizeGlob(pattern));
         PathMatcher fileNameMatcher = projectRoot.getFileSystem().getPathMatcher("glob:" + normalizeFileNameGlob(pattern));
-        List<String> matches = new ArrayList<>();
+        // 先收集全部命中（受 MAX_GLOB_SCAN 上限），再按修改时间降序排（最近改的最相关），最后截到 maxResults。
+        List<Path> candidates = new ArrayList<>();
 
         try {
             Files.walkFileTree(root, new SearchFileVisitor(projectRoot, path -> {
-                if (matches.size() >= maxResults) {
+                if (candidates.size() >= MAX_GLOB_SCAN) {
                     return;
                 }
                 Path relative = projectRoot.relativize(path);
                 if (matcher.matches(relative) || fileNameMatcher.matches(path.getFileName())) {
-                    matches.add(relative.toString());
+                    candidates.add(path);
                 }
             }));
         } catch (Exception e) {
             return "文件匹配失败: " + e.getMessage();
         }
 
-        if (matches.isEmpty()) {
+        if (candidates.isEmpty()) {
             return "未找到匹配文件: " + pattern;
         }
+        int total = candidates.size();
+        sortByMtimeDesc(candidates, p -> p);
+        List<String> matches = new ArrayList<>();
+        for (int i = 0; i < candidates.size() && matches.size() < maxResults; i++) {
+            matches.add(projectRoot.relativize(candidates.get(i)).toString());
+        }
+
         StringBuilder sb = new StringBuilder();
         sb.append("匹配文件 ").append(matches.size()).append(" 个");
-        if (matches.size() >= maxResults) {
-            sb.append("（已达到上限 ").append(maxResults).append("）");
+        if (total > matches.size()) {
+            sb.append("（共 ").append(total).append(" 个，按最近修改取前 ").append(maxResults).append("）");
         }
         sb.append(":\n");
         for (int i = 0; i < matches.size(); i++) {
             sb.append(i + 1).append(". ").append(matches.get(i)).append("\n");
         }
         return sb.toString().trim();
+    }
+
+    /**
+     * 按文件修改时间降序排序（最近改的排前面，通常最相关——对照 Claude Code GrepTool 的 files_with_matches）。
+     * stat 失败的项按 mtime=0 沉底，不抛错。keyFn 把列表元素映射成可 stat 的绝对/相对 Path。
+     * 用一个 map 缓存每个 Path 的 mtime，避免比较器里重复 stat（O(n log n) 次 syscall → O(n) 次）。
+     */
+    private <T> void sortByMtimeDesc(List<T> items, java.util.function.Function<T, Path> keyFn) {
+        Map<Path, Long> mtimeCache = new java.util.HashMap<>();
+        for (T item : items) {
+            Path p = keyFn.apply(item);
+            mtimeCache.computeIfAbsent(p, k -> {
+                try {
+                    return Files.getLastModifiedTime(k).toMillis();
+                } catch (Exception e) {
+                    return 0L;
+                }
+            });
+        }
+        items.sort((a, b) -> Long.compare(
+                mtimeCache.getOrDefault(keyFn.apply(b), 0L),
+                mtimeCache.getOrDefault(keyFn.apply(a), 0L)));
     }
 
     private String grepCode(Map<String, String> args) {
@@ -702,6 +810,8 @@ public class ToolRegistry {
         if (matches.isEmpty()) {
             return "未找到匹配内容: " + query;
         }
+        // 按文件修改时间降序排（最近改的最相关）。同文件多条命中 mtime 相同，稳定排序保持其分组与行序。
+        sortByMtimeDesc(matches, m -> projectRoot.resolve(m.file()));
         StringBuilder sb = new StringBuilder();
         sb.append("匹配结果 ").append(matches.size()).append(" 条");
         if (matches.size() >= maxResults) {

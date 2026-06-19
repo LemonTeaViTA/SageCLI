@@ -56,9 +56,9 @@ class ToolRegistryTest {
     }
 
     @Test
-    void shouldDegradeOversizedFullReadInsteadOfLoadingAll(@TempDir Path tempDir) throws Exception {
-        // 构造一个 >5MB 的文件，不带 offset/limit 全文读取应降级为只读前若干行 + 分页提示，
-        // 而不是把整段灌进上下文（防 OOM / token 爆炸）。
+    void shouldRejectOversizedFullReadInsteadOfTruncating(@TempDir Path tempDir) throws Exception {
+        // 构造一个 >5MB 的文件，不带 offset/limit 全文读取应直接抛错 + 提示用 offset/limit 或 grep，
+        // 而不是降级读前 N 行（截断的头部会随历史逐轮重发烧 token，且大概率不是模型要的内容）。
         Path big = tempDir.resolve("huge.log");
         StringBuilder line = new StringBuilder();
         for (int i = 0; i < 200; i++) line.append("x");
@@ -72,11 +72,31 @@ class ToolRegistryTest {
 
         String result = registry.executeTool("read_file", "{\"path\":\"huge.log\"}");
 
-        assertTrue(result.contains("超过 5MB 上限"), "应提示超限: " + result.substring(0, Math.min(120, result.length())));
-        assertTrue(result.contains("offset/limit 分页"), "应提示分页读取");
-        assertTrue(result.contains("    1 | line0-"), "应包含前几行内容");
-        // 降级后不应包含尾部行（证明没有整段读出）
-        assertTrue(!result.contains("line29999-"), "降级后不应含尾部内容");
+        assertTrue(result.contains("读取文件失败"), "应是失败而非降级读取: " + result.substring(0, Math.min(120, result.length())));
+        assertTrue(result.contains("超过 5MB 上限"), "应提示超限");
+        assertTrue(result.contains("offset/limit") && result.contains("grep_code"), "应提示用 offset/limit 或 grep_code");
+        // 抛错路径不应包含任何文件内容（证明没有读出头部）
+        assertTrue(!result.contains("line0-"), "抛错时不应含文件内容");
+    }
+
+    @Test
+    void shouldStillReadOversizedFileWhenRangedExplicitly(@TempDir Path tempDir) throws Exception {
+        // 超大文件带 offset/limit 显式分页时仍应正常读取指定区间（抛错只针对无范围的整段读）。
+        Path big = tempDir.resolve("huge2.log");
+        StringBuilder line = new StringBuilder();
+        for (int i = 0; i < 200; i++) line.append("x");
+        StringBuilder content = new StringBuilder();
+        for (int i = 0; i < 30_000; i++) {
+            content.append("line").append(i).append("-").append(line).append("\n");
+        }
+        Files.writeString(big, content.toString());
+        ToolRegistry registry = new ToolRegistry();
+        registry.setProjectPath(tempDir.toString());
+
+        String result = registry.executeTool("read_file", "{\"path\":\"huge2.log\",\"offset\":1,\"limit\":3}");
+
+        assertTrue(result.contains("    1 | line0-"), "带范围应能读到指定区间: " + result.substring(0, Math.min(120, result.length())));
+        assertTrue(!result.contains("读取文件失败"), "带 offset/limit 不应抛超限错");
     }
 
     @Test
@@ -92,6 +112,99 @@ class ToolRegistryTest {
         assertTrue(result.contains("hello"));
         assertTrue(result.contains("world"));
         assertTrue(!result.contains("超过 5MB"), "正常文件不应触发降级");
+    }
+
+    @Test
+    void shouldDedupUnchangedRepeatedReadWithinWindow(@TempDir Path tempDir) throws Exception {
+        // 同文件、同区间、mtime 未变且在近窗内重复读 → 第二次回"文件未变化"短桩，不重发内容（省 token）。
+        Path file = tempDir.resolve("stable.txt");
+        Files.writeString(file, "alpha\nbeta\ngamma\n");
+        ToolRegistry registry = new ToolRegistry();
+        registry.setProjectPath(tempDir.toString());
+
+        String first = registry.executeTool("read_file", "{\"path\":\"stable.txt\"}");
+        String second = registry.executeTool("read_file", "{\"path\":\"stable.txt\"}");
+
+        assertTrue(first.contains("alpha") && first.contains("gamma"), "首次应返回完整内容");
+        assertTrue(second.contains("文件未变化"), "二次应回去重短桩: " + second);
+        assertTrue(!second.contains("gamma"), "去重短桩不应重发文件内容");
+    }
+
+    @Test
+    void shouldResendContentAfterFileChangesBetweenReads(@TempDir Path tempDir) throws Exception {
+        // mtime 变了就必须重发内容，不能命中去重（防把旧内容当现状）。
+        Path file = tempDir.resolve("mut.txt");
+        Files.writeString(file, "v1-original\n");
+        Files.setLastModifiedTime(file, java.nio.file.attribute.FileTime.fromMillis(1_000_000_000_000L));
+        ToolRegistry registry = new ToolRegistry();
+        registry.setProjectPath(tempDir.toString());
+
+        String first = registry.executeTool("read_file", "{\"path\":\"mut.txt\"}");
+        Files.writeString(file, "v2-changed\n");
+        Files.setLastModifiedTime(file, java.nio.file.attribute.FileTime.fromMillis(1_000_086_400_000L));
+        String second = registry.executeTool("read_file", "{\"path\":\"mut.txt\"}");
+
+        assertTrue(first.contains("v1-original"));
+        assertTrue(second.contains("v2-changed"), "文件已变应重发新内容: " + second);
+        assertTrue(!second.contains("文件未变化"), "变了不应命中去重");
+    }
+
+    @Test
+    void shouldBlockEditWhenFileChangedAfterRead(@TempDir Path tempDir) throws Exception {
+        // 读过之后文件被外部改动（mtime 变）→ edit 应拦截并要求重读，防"静默改错位置"。
+        Path file = tempDir.resolve("Conf.java");
+        Files.writeString(file, "class Conf {\n  int port = 8080;\n}\n");
+        Files.setLastModifiedTime(file, java.nio.file.attribute.FileTime.fromMillis(1_000_000_000_000L));
+        ToolRegistry registry = new ToolRegistry();
+        registry.setProjectPath(tempDir.toString());
+
+        registry.executeTool("read_file", "{\"path\":\"Conf.java\"}");
+        // 模拟外部修改
+        Files.writeString(file, "class Conf {\n  int port = 9090;\n}\n");
+        Files.setLastModifiedTime(file, java.nio.file.attribute.FileTime.fromMillis(1_000_086_400_000L));
+
+        String result = registry.executeTool("edit_file",
+                "{\"path\":\"Conf.java\",\"old_string\":\"int port = 8080;\",\"new_string\":\"int port = 7000;\"}");
+
+        assertTrue(result.contains("已被修改") && result.contains("重新 read_file"),
+                "应拦截过期编辑并要求重读: " + result);
+        // 文件不应被改动（仍是外部写入的 9090）
+        assertTrue(Files.readString(file).contains("9090"), "拦截后不应执行编辑");
+    }
+
+    @Test
+    void shouldAllowEditWhenNeverReadBefore(@TempDir Path tempDir) throws Exception {
+        // 从未 read_file 过的文件直接 edit 仍应允许（保守：不破坏 SageCLI 既有免读直编行为）。
+        Path file = tempDir.resolve("Fresh.java");
+        Files.writeString(file, "class Fresh {\n  int v = 1;\n}\n");
+        ToolRegistry registry = new ToolRegistry();
+        registry.setProjectPath(tempDir.toString());
+
+        String result = registry.executeTool("edit_file",
+                "{\"path\":\"Fresh.java\",\"old_string\":\"int v = 1;\",\"new_string\":\"int v = 2;\"}");
+
+        assertTrue(result.contains("文件已编辑"), "未读过的文件应允许直编: " + result);
+        assertTrue(Files.readString(file).contains("int v = 2;"));
+    }
+
+    @Test
+    void shouldAllowConsecutiveEditsWithoutStaleFalsePositive(@TempDir Path tempDir) throws Exception {
+        // 读 → 编辑 → 再编辑：第二次编辑不应因第一次编辑改了 mtime 而误判"已被修改"。
+        Path file = tempDir.resolve("Seq.java");
+        Files.writeString(file, "class Seq {\n  int a = 1;\n  int b = 2;\n}\n");
+        ToolRegistry registry = new ToolRegistry();
+        registry.setProjectPath(tempDir.toString());
+
+        registry.executeTool("read_file", "{\"path\":\"Seq.java\"}");
+        String e1 = registry.executeTool("edit_file",
+                "{\"path\":\"Seq.java\",\"old_string\":\"int a = 1;\",\"new_string\":\"int a = 10;\"}");
+        String e2 = registry.executeTool("edit_file",
+                "{\"path\":\"Seq.java\",\"old_string\":\"int b = 2;\",\"new_string\":\"int b = 20;\"}");
+
+        assertTrue(e1.contains("文件已编辑"), "首次编辑应成功: " + e1);
+        assertTrue(e2.contains("文件已编辑"), "连续编辑不应误判过期: " + e2);
+        String finalContent = Files.readString(file);
+        assertTrue(finalContent.contains("int a = 10;") && finalContent.contains("int b = 20;"));
     }
 
     @Test
@@ -231,6 +344,27 @@ class ToolRegistryTest {
         String result = registry.executeTool("glob_files", "{\"pattern\":\"README.md\"}");
 
         assertTrue(result.contains("README.md"));
+    }
+
+    @Test
+    void shouldOrderGlobResultsByMostRecentlyModified(@TempDir Path tempDir) throws Exception {
+        // glob 结果应按修改时间降序（最近改的排前），与 Claude Code GrepTool 的相关性排序一致。
+        Path older = tempDir.resolve("Older.java");
+        Path newer = tempDir.resolve("Newer.java");
+        Files.writeString(older, "class Older {}\n");
+        Files.writeString(newer, "class Newer {}\n");
+        // 显式设置修改时间：older 比 newer 早一天，避免依赖写入顺序的时序精度。
+        Files.setLastModifiedTime(older, java.nio.file.attribute.FileTime.fromMillis(1_000_000_000_000L));
+        Files.setLastModifiedTime(newer, java.nio.file.attribute.FileTime.fromMillis(1_000_086_400_000L));
+        ToolRegistry registry = new ToolRegistry();
+        registry.setProjectPath(tempDir.toString());
+
+        String result = registry.executeTool("glob_files", "{\"pattern\":\"*.java\"}");
+
+        int idxNewer = result.indexOf("Newer.java");
+        int idxOlder = result.indexOf("Older.java");
+        assertTrue(idxNewer >= 0 && idxOlder >= 0, "两个文件都应命中: " + result);
+        assertTrue(idxNewer < idxOlder, "最近修改的 Newer.java 应排在 Older.java 之前: " + result);
     }
 
     @Test
