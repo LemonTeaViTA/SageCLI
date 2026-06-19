@@ -13,6 +13,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class ToolRegistryTest {
@@ -34,6 +35,21 @@ class ToolRegistryTest {
         String result = registry.executeTool("execute_command", "{\"command\":\"find / -name \\\"pom.xml\\\" -type f | head -20\"}");
 
         assertTrue(result.contains("策略拒绝"));
+    }
+
+    @Test
+    void shouldKeepTailWhenCommandOutputTooLarge(@TempDir Path tempDir) {
+        // 命令输出超上限时保尾截断：报错/exit code 常在尾部，尾部内容必须保住，头部可丢。
+        ToolRegistry registry = new ToolRegistry();
+        registry.setProjectPath(tempDir.toString());
+
+        // 2000 行 "line N" 远超 8000 字符上限。
+        String result = registry.executeTool("execute_command",
+                "{\"command\":\"for i in $(seq 1 2000); do echo line $i; done\"}");
+
+        assertTrue(result.contains("输出头部已截断"), "应标注头部截断: " + result.substring(0, Math.min(200, result.length())));
+        assertTrue(result.contains("line 2000"), "尾部内容应保留");
+        assertFalse(result.contains("line 1\n"), "头部内容应被截掉");
     }
 
     @Test

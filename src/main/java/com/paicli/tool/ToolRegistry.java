@@ -126,6 +126,15 @@ public class ToolRegistry {
     /** 一次读取的快照：mtime（毫秒）、读取的区间（offset/limit，整段读为 null）、当时的读取序号。 */
     private record ReadRecord(long mtimeMs, Integer offset, Integer limit, long seq) {}
 
+    // 会话级任务清单（update_todos 工具用）：学自 CC TodoWriteTool——模型自己管的草稿板，不是执行引擎。
+    // 无依赖/无拓扑/无执行（那是 /plan DAG 的职责），只是让模型把中等复杂任务的步骤外显出来，
+    // 减少漏步、进度可见。整表替换式更新；全部完成即清空。随 ToolRegistry 实例生命周期（会话级）。
+    private final List<TodoItem> todos =
+            java.util.Collections.synchronizedList(new ArrayList<>());
+
+    /** 一条待办：content（祈使态，"运行测试"）、activeForm（进行态，"正在运行测试"）、status（三态）。 */
+    public record TodoItem(String content, String activeForm, String status) {}
+
     public ToolRegistry() {
         this(DEFAULT_COMMAND_TIMEOUT_SECONDS, DEFAULT_TOOL_BATCH_TIMEOUT_SECONDS);
     }
@@ -140,6 +149,7 @@ public class ToolRegistry {
         // 注册内置工具
         registerFileTools();
         registerShellTools();
+        registerTodoTool();
         registerCodeTools();
         registerRagTools();
         registerWebTools();
@@ -1027,6 +1037,48 @@ public class ToolRegistry {
     }
 
     /**
+     * 注册任务清单工具（update_todos）。学自 CC TodoWriteTool：模型自己管的草稿板，不替模型执行。
+     * 与 /plan DAG 职责正交——plan 管"需拆解+依赖+审批"的大任务，update_todos 管"主循环里自我跟踪"的中任务。
+     */
+    private void registerTodoTool() {
+        tools.put("update_todos", new Tool(
+                "update_todos",
+                "维护当前会话的任务清单，跟踪多步任务进度。适用于 3+ 步骤的中等复杂任务：开工前把步骤列出来，"
+                        + "开始某步时标 in_progress（任意时刻只允许一个 in_progress），完成立即标 completed（不要批量）。"
+                        + "单步/琐碎任务不要用——直接做更好。每次传完整列表（整表替换）；全部完成后清单会自动清空。",
+                buildTodoParameters(),
+                args -> updateTodos(args.get("todos"))
+        ));
+    }
+
+    /** update_todos 的入参 schema：todos 数组，每项 {content, activeForm, status} 带完整 items 定义。 */
+    private JsonNode buildTodoParameters() {
+        ObjectNode parameters = mapper.createObjectNode();
+        parameters.put("type", "object");
+        ObjectNode properties = parameters.putObject("properties");
+
+        ObjectNode todosProp = properties.putObject("todos");
+        todosProp.put("type", "array");
+        todosProp.put("description", "完整任务列表（整表替换）。每次都传全量，不要只传增量。");
+
+        ObjectNode items = todosProp.putObject("items");
+        items.put("type", "object");
+        ObjectNode itemProps = items.putObject("properties");
+        itemProps.putObject("content").put("type", "string")
+                .put("description", "祈使态描述，如\"运行测试\"");
+        itemProps.putObject("activeForm").put("type", "string")
+                .put("description", "进行态描述，如\"正在运行测试\"");
+        ObjectNode statusProp = itemProps.putObject("status");
+        statusProp.put("type", "string");
+        statusProp.put("description", "pending | in_progress | completed");
+        statusProp.putArray("enum").add("pending").add("in_progress").add("completed");
+        items.putArray("required").add("content").add("activeForm").add("status");
+
+        parameters.putArray("required").add("todos");
+        return parameters;
+    }
+
+    /**
      * 注册代码相关工具
      */
     private void registerCodeTools() {
@@ -1660,8 +1712,14 @@ public class ToolRegistry {
 
             JsonNode args = mapper.readTree(argumentsJson);
             Map<String, String> argMap = new HashMap<>();
-            args.fields().forEachRemaining(entry ->
-                    argMap.put(entry.getKey(), entry.getValue().asText()));
+            args.fields().forEachRemaining(entry -> {
+                JsonNode value = entry.getValue();
+                // 标量走 asText()（兼容历史行为）；array/object 保留原始 JSON 字符串，
+                // 否则 asText() 对容器节点返回空串——结构化参数（如 update_todos 的 todos 数组）会丢失。
+                // executor 拿到原始 JSON 自行解析，对仅用标量的旧工具完全无影响。
+                argMap.put(entry.getKey(),
+                        value.isContainerNode() ? value.toString() : value.asText());
+            });
             String result = tool.executor().execute(argMap);
             if (shouldAudit) {
                 auditLog.record(AuditLog.AuditEntry.allow(name, argumentsJson, elapsedMillis(start), auditMetadata));
@@ -1799,6 +1857,77 @@ public class ToolRegistry {
         return base + " (MCP server: " + descriptor.serverName() + ", tool: " + descriptor.name() + ")";
     }
 
+    private String updateTodos(String todosJson) {
+        if (todosJson == null || todosJson.isBlank()) {
+            return "update_todos 失败：todos 不能为空，请传完整任务列表（数组）。";
+        }
+        List<TodoItem> parsed = new ArrayList<>();
+        try {
+            JsonNode arr = mapper.readTree(todosJson);
+            if (!arr.isArray()) {
+                return "update_todos 失败：todos 必须是数组，每项为 {content, activeForm, status}。";
+            }
+            int inProgress = 0;
+            for (JsonNode node : arr) {
+                String content = node.path("content").asText("").trim();
+                String activeForm = node.path("activeForm").asText("").trim();
+                String status = node.path("status").asText("").trim();
+                if (content.isEmpty()) {
+                    return "update_todos 失败：每条 todo 的 content 不能为空。";
+                }
+                if (!status.equals("pending") && !status.equals("in_progress") && !status.equals("completed")) {
+                    return "update_todos 失败：status 必须是 pending / in_progress / completed 之一，收到：'" + status + "'。";
+                }
+                if (status.equals("in_progress")) {
+                    inProgress++;
+                }
+                // activeForm 缺省时用 content 兜底，避免渲染空白。
+                parsed.add(new TodoItem(content, activeForm.isEmpty() ? content : activeForm, status));
+            }
+            if (inProgress > 1) {
+                return "update_todos 失败：任意时刻只允许一个 in_progress，收到 " + inProgress + " 个。请只把当前正在做的那一步标为 in_progress。";
+            }
+        } catch (Exception e) {
+            return "update_todos 失败：todos 解析错误：" + e.getMessage();
+        }
+
+        boolean allDone = !parsed.isEmpty() && parsed.stream().allMatch(t -> t.status().equals("completed"));
+        synchronized (todos) {
+            todos.clear();
+            // 全部完成即清空清单（学自 CC：allDone → []），下次再有多步任务重新建。
+            if (!allDone) {
+                todos.addAll(parsed);
+            }
+        }
+        return renderTodos(parsed, allDone);
+    }
+
+    /** 把清单渲染成给模型看的文本：勾选框 + 进行态高亮。allDone 时回收尾提示。 */
+    private String renderTodos(List<TodoItem> items, boolean allDone) {
+        if (allDone) {
+            return "✅ 全部 " + items.size() + " 项任务已完成，清单已清空。";
+        }
+        StringBuilder sb = new StringBuilder("任务清单已更新：\n");
+        for (TodoItem t : items) {
+            String box = switch (t.status()) {
+                case "completed" -> "[x]";
+                case "in_progress" -> "[→]";
+                default -> "[ ]";
+            };
+            // 进行中的项显示进行态文案，其余显示祈使态。
+            String label = t.status().equals("in_progress") ? t.activeForm() : t.content();
+            sb.append(box).append(' ').append(label).append('\n');
+        }
+        return sb.toString().stripTrailing();
+    }
+
+    /** 当前会话任务清单的只读快照（供渲染层 / 测试使用）。 */
+    public List<TodoItem> getTodos() {
+        synchronized (todos) {
+            return List.copyOf(todos);
+        }
+    }
+
     private String executeCommand(String command) {
         String normalized = command == null ? "" : command.trim();
         if (normalized.isEmpty()) {
@@ -1858,23 +1987,30 @@ public class ToolRegistry {
     }
 
     private String readProcessOutput(Process process) throws Exception {
+        // 保尾截断：命令的报错信息 / exit code 通常在输出尾部，截头比截尾更可能保住模型真正需要的内容
+        // （与 read_file 保头相反——文件结构在头部，命令结论在尾部）。
+        // 滚动保留末尾 MAX_COMMAND_OUTPUT_CHARS 字符：用 2× 高水位线触发裁剪，使整体裁剪成本保持线性
+        // （每增长 MAX 才裁一次，每次 O(MAX)），避免逐行 delete 退化成 O(n²)。
         StringBuilder output = new StringBuilder();
+        boolean truncated = false;
+        int highWater = MAX_COMMAND_OUTPUT_CHARS * 2;
         try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
             String line;
             while ((line = reader.readLine()) != null) {
-                if (output.length() < MAX_COMMAND_OUTPUT_CHARS) {
-                    int remaining = MAX_COMMAND_OUTPUT_CHARS - output.length();
-                    if (line.length() > remaining) {
-                        output.append(line, 0, remaining);
-                    } else {
-                        output.append(line);
-                    }
-                    output.append("\n");
+                output.append(line).append("\n");
+                if (output.length() > highWater) {
+                    output.delete(0, output.length() - MAX_COMMAND_OUTPUT_CHARS);
+                    truncated = true;
                 }
             }
         }
-        if (output.length() >= MAX_COMMAND_OUTPUT_CHARS) {
-            return output.substring(0, MAX_COMMAND_OUTPUT_CHARS) + "\n...(输出已截断)";
+        // 收尾再裁一次：可能在 (MAX, 2*MAX] 区间结束循环却没触发过高水位裁剪。
+        if (output.length() > MAX_COMMAND_OUTPUT_CHARS) {
+            output.delete(0, output.length() - MAX_COMMAND_OUTPUT_CHARS);
+            truncated = true;
+        }
+        if (truncated) {
+            return "...(输出头部已截断，保留末尾 " + MAX_COMMAND_OUTPUT_CHARS + " 字符)\n" + output;
         }
         return output.toString();
     }
