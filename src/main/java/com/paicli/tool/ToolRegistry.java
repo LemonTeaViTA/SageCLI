@@ -107,6 +107,9 @@ public class ToolRegistry {
 
     // dispatch_agent 用：派生子 agent 需要 LlmClient。ToolRegistry 本身不持有，由 Agent 构造时注入。
     private com.paicli.llm.LlmClient agentDispatchLlmClient;
+    // web_fetch 的 AI 摘要用：把抓取的长网页喂给（通常更便宜的）小模型浓缩，主模型只看结论。
+    // 由主程序注入（配了 webFetchSummaryProvider 用专属模型，否则复用主模型）；未注入则降级返回原文截断。
+    private com.paicli.llm.LlmClient webFetchSummaryClient;
     // 防递归深度计数：进入 dispatch_agent +1，退出 -1；>1 直接拒绝，防子 agent 再派孙 agent。
     private final java.util.concurrent.atomic.AtomicInteger agentDispatchDepth = new java.util.concurrent.atomic.AtomicInteger();
     // 检索子 agent 的只读工具白名单：只给检索类，不给写/执行/快照，更不含 dispatch_agent 本身（防递归主闸）。
@@ -170,6 +173,14 @@ public class ToolRegistry {
      */
     public void setAgentDispatchLlmClient(com.paicli.llm.LlmClient agentDispatchLlmClient) {
         this.agentDispatchLlmClient = agentDispatchLlmClient;
+    }
+
+    /**
+     * 注入 web_fetch AI 摘要所用的 LlmClient。配了 webFetchSummaryProvider 时传专属（便宜）模型，
+     * 否则主程序传主模型复用。未注入（null）时 web_fetch 带 prompt 也只能降级返回原文截断。
+     */
+    public void setWebFetchSummaryClient(com.paicli.llm.LlmClient webFetchSummaryClient) {
+        this.webFetchSummaryClient = webFetchSummaryClient;
     }
 
     /**
@@ -1261,12 +1272,14 @@ public class ToolRegistry {
         tools.put("web_fetch", new Tool(
                 "web_fetch",
                 "抓取指定 URL，提取正文转 Markdown。" +
-                        "适用静态 / SSR 页面（博客、文档、官网）；JS 渲染或防爬站会返回空正文，本期不重试。",
+                        "适用静态 / SSR 页面（博客、文档、官网）；JS 渲染或防爬站会返回空正文，本期不重试。" +
+                        "可选 prompt：填了就用小模型按你的问题对正文做摘要/检索（省 token，只回相关结论）；不填则返回正文原文（截断）。",
                 createParameters(
                         new Param("url", "string", "完整 URL，需 http 或 https 协议", true),
-                        new Param("max_chars", "integer", "返回 Markdown 最大字符数（默认 8000，超出截断）", false)
+                        new Param("prompt", "string", "可选：要从页面提取什么信息（如\"这个 API 怎么用\"）。填了走 AI 摘要，不填返回原文", false),
+                        new Param("max_chars", "integer", "返回 Markdown 最大字符数（默认 8000，仅原文模式生效）", false)
                 ),
-                args -> webFetch(args.get("url"), parseInt(args.get("max_chars"), DEFAULT_FETCH_MAX_CHARS))
+                args -> webFetch(args.get("url"), args.get("prompt"), parseInt(args.get("max_chars"), DEFAULT_FETCH_MAX_CHARS))
         ));
     }
 
@@ -1590,7 +1603,7 @@ public class ToolRegistry {
         return sb.toString().trim();
     }
 
-    String webFetch(String url, int maxChars) {
+    String webFetch(String url, String prompt, int maxChars) {
         if (url == null || url.isBlank()) {
             return "URL 不能为空";
         }
@@ -1609,6 +1622,17 @@ public class ToolRegistry {
             HtmlExtractor.Extracted extracted = htmlExtractor().extract(raw.body(), raw.url());
             String markdown = extracted.markdown();
             int originalLength = markdown.length();
+
+            // 摘要模式：填了 prompt 且摘要 client 可用 → 用小模型按 prompt 浓缩正文，主模型只看结论（省 token）。
+            // 任一不满足（没 prompt / 没注入 client / 正文为空 / 调用异常）都降级到原文截断（同 dispatch_agent 降级思路）。
+            if (prompt != null && !prompt.isBlank() && webFetchSummaryClient != null && !markdown.isBlank()) {
+                String summary = summarizeFetchedContent(markdown, prompt);
+                if (summary != null) {
+                    return formatFetchSummary(raw.url(), extracted.title(), prompt, summary, originalLength);
+                }
+                // summary==null 表示摘要失败，落到下面原文截断。
+            }
+
             boolean truncated = false;
             if (maxChars > 0 && markdown.length() > maxChars) {
                 markdown = markdown.substring(0, maxChars);
@@ -1619,6 +1643,47 @@ public class ToolRegistry {
         } catch (Exception e) {
             return "抓取失败: " + e.getMessage();
         }
+    }
+
+    /** 摘要喂给二级模型的正文输入上限：防 prompt 过长被 API 拒；对标 CC 的 MAX_MARKDOWN_LENGTH（取更保守值）。 */
+    private static final int MAX_SUMMARY_INPUT_CHARS = 100_000;
+
+    /**
+     * 用摘要 client（通常是便宜小模型）按 prompt 对正文做浓缩/检索。
+     * @return 浓缩结果；失败（异常/空响应）返回 null 让调用方降级到原文截断。
+     */
+    String summarizeFetchedContent(String markdown, String prompt) {
+        String content = markdown.length() > MAX_SUMMARY_INPUT_CHARS
+                ? markdown.substring(0, MAX_SUMMARY_INPUT_CHARS) + "\n\n[正文过长已截断…]"
+                : markdown;
+        String userPrompt = "网页正文：\n---\n" + content + "\n---\n\n" + prompt
+                + "\n\n请仅基于上面的正文简洁作答：提取与问题相关的信息、必要的代码示例或文档片段；"
+                + "正文里没有的就说没有，不要编造。";
+        try {
+            List<com.paicli.llm.LlmClient.Message> messages = List.of(
+                    com.paicli.llm.LlmClient.Message.system("你是网页内容提炼助手，基于给定正文简洁、准确地回答用户问题，不展开无关内容。"),
+                    com.paicli.llm.LlmClient.Message.user(userPrompt));
+            com.paicli.llm.LlmClient.ChatResponse resp = webFetchSummaryClient.chat(messages, List.of());
+            if (resp == null || resp.content() == null || resp.content().isBlank()) {
+                return null;
+            }
+            return resp.content().trim();
+        } catch (Exception e) {
+            log.warn("web_fetch 摘要失败，降级返回原文截断: {}", e.getMessage());
+            return null;
+        }
+    }
+
+    private String formatFetchSummary(String url, String title, String prompt, String summary, int originalLength) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("🌐 抓取: ").append(url).append("\n");
+        if (title != null && !title.isBlank()) {
+            sb.append("📄 标题: ").append(title).append("\n");
+        }
+        sb.append("🔍 已按你的问题对正文（").append(originalLength).append(" 字符）做 AI 摘要：\n");
+        sb.append("（问题：").append(prompt).append("）\n\n---\n\n");
+        sb.append(summary);
+        return sb.toString();
     }
 
     private String formatFetchResult(FetchResult result) {

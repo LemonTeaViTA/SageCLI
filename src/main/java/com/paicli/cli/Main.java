@@ -308,6 +308,21 @@ public class Main {
             hitlToolRegistry.setSkillContextBuffer(skillContextBuffer);
 
             Agent reactAgent = new Agent(llmClient, hitlToolRegistry);
+            // web_fetch AI 摘要的 client：配了 webFetchSummaryProvider 且能建出 → 用专属（便宜小）模型；
+            // 否则复用主 llmClient（开箱即用）。建不出则退回主模型，绝不让 web_fetch 因此不可用。
+            LlmClient webFetchSummaryClient = llmClient;
+            String summaryProvider = config == null ? null : config.getWebFetchSummaryProvider();
+            if (summaryProvider != null && !summaryProvider.isBlank()) {
+                LlmClient dedicated = LlmClientFactory.create(summaryProvider.trim(), config);
+                if (dedicated != null) {
+                    webFetchSummaryClient = dedicated;
+                    out.println("🔍 web_fetch 摘要使用独立模型: " + dedicated.getDisplayName());
+                } else {
+                    out.println("⚠️ webFetchSummaryProvider=\"" + summaryProvider
+                            + "\" 未能创建（缺 key/配置？），web_fetch 摘要退回使用主模型");
+                }
+            }
+            hitlToolRegistry.setWebFetchSummaryClient(webFetchSummaryClient);
             reactAgent.setExternalContextSupplier(mcpServerManager::resourceIndexForPrompt);
             reactAgent.setSkillRegistry(skillRegistry);
             reactAgent.setSkillContextBuffer(skillContextBuffer);

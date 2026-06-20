@@ -28,6 +28,9 @@ public class PaiCliConfig {
     // 可选：Multi-Agent（/team）模式下 Reviewer 用哪个 provider（指向某个模型条目名）。
     // 不配则 Reviewer 复用 Worker 同款模型（默认行为）。配成不同模型可降同模型 self-review 盲点。
     private String reviewerProvider;
+    // 可选：web_fetch 的 AI 摘要用哪个 provider（指向某个模型条目名）。摘要是"读长网页提炼"的脏活，
+    // 配个便宜小快模型最划算（对标 CC 用 Haiku）。不配则复用主模型；建不出则降级返回原文截断。
+    private String webFetchSummaryProvider;
     // 两层结构（新）：平台层存共享的 key/baseUrl/series，模型层只引用平台 + 写 model/displayName。
     // 同平台多模型不再重复填 key/baseUrl。
     private Map<String, PlatformConfig> platforms = new LinkedHashMap<>();
@@ -116,6 +119,8 @@ public class PaiCliConfig {
     public String getDefaultProvider() { return defaultProvider; }
     public void setReviewerProvider(String reviewerProvider) { this.reviewerProvider = reviewerProvider; }
     public String getReviewerProvider() { return reviewerProvider; }
+    public void setWebFetchSummaryProvider(String webFetchSummaryProvider) { this.webFetchSummaryProvider = webFetchSummaryProvider; }
+    public String getWebFetchSummaryProvider() { return webFetchSummaryProvider; }
     public void setDefaultProvider(String defaultProvider) { this.defaultProvider = defaultProvider; }
     public Map<String, ProviderConfig> getProviders() { return providers; }
     public void setProviders(Map<String, ProviderConfig> providers) { this.providers = providers; }
