@@ -451,15 +451,15 @@ class ToolRegistryTest {
         };
 
         List<ToolRegistry.ToolExecutionResult> results = registry.executeTools(List.of(
-                new ToolRegistry.ToolInvocation("call_1", "first", "{}"),
-                new ToolRegistry.ToolInvocation("call_2", "second", "{}")
+                new ToolRegistry.ToolInvocation("call_1", "read_file", "{}"),
+                new ToolRegistry.ToolInvocation("call_2", "list_dir", "{}")
         ));
 
-        assertEquals(2, peak.get(), "两个工具调用应并行执行");
+        assertEquals(2, peak.get(), "两个只读工具调用应并行执行");
         assertEquals("call_1", results.get(0).id());
-        assertEquals("result-first", results.get(0).result());
+        assertEquals("result-read_file", results.get(0).result());
         assertEquals("call_2", results.get(1).id());
-        assertEquals("result-second", results.get(1).result());
+        assertEquals("result-list_dir", results.get(1).result());
     }
 
     @Test
@@ -467,7 +467,7 @@ class ToolRegistryTest {
         ToolRegistry registry = new ToolRegistry(1, 1) {
             @Override
             public String executeTool(String name, String argumentsJson) {
-                if ("slow".equals(name)) {
+                if ("read_file".equals(name)) {
                     try {
                         Thread.sleep(3000);
                     } catch (InterruptedException e) {
@@ -479,13 +479,13 @@ class ToolRegistryTest {
         };
 
         List<ToolRegistry.ToolExecutionResult> results = registry.executeTools(List.of(
-                new ToolRegistry.ToolInvocation("call_1", "slow", "{}"),
-                new ToolRegistry.ToolInvocation("call_2", "fast", "{}")
+                new ToolRegistry.ToolInvocation("call_1", "read_file", "{}"),
+                new ToolRegistry.ToolInvocation("call_2", "list_dir", "{}")
         ));
 
         assertTrue(results.get(0).timedOut());
         assertTrue(results.get(0).result().contains("工具执行超时"));
-        assertEquals("result-fast", results.get(1).result());
+        assertEquals("result-list_dir", results.get(1).result());
     }
 
     @Test

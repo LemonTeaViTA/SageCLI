@@ -1880,6 +1880,17 @@ public class ToolRegistry {
         }
     }
 
+    // 只读工具白名单：同一轮 LLM 返回多个工具调用时，只有这些无副作用的查询/读取类可以并行。
+    // 写/编辑/执行/MCP（副作用未知）等一律串行，且作为屏障——夹在两次读之间的写会强制顺序，
+    // 防"读到的是写之前还是之后"的竞态。安全优先：不在白名单的工具默认当写处理。
+    private static final Set<String> READ_ONLY_TOOLS = Set.of(
+            "read_file", "list_dir", "glob_files", "grep_code", "search_code",
+            "web_search", "web_fetch", "check_command", "browser_status");
+
+    private boolean isReadOnlyTool(String name) {
+        return name != null && READ_ONLY_TOOLS.contains(name);
+    }
+
     private boolean isLegacyExecuteToolOverride() {
         try {
             return getClass()
@@ -1902,10 +1913,14 @@ public class ToolRegistry {
     }
 
     /**
-     * 并行执行同一轮 LLM 返回的多个工具调用。
+     * 执行同一轮 LLM 返回的多个工具调用。
      *
-     * 结果按传入顺序返回，调用方可以安全地按原 tool_call 顺序回灌消息历史。
-     * 如果某个工具超过批次超时仍未返回，会取消任务并返回超时结果；已完成工具不受影响。
+     * <p>调度策略（读并行 / 写串行）：按传入顺序扫描，连续的<b>只读</b>工具（{@link #READ_ONLY_TOOLS}）
+     * 攒成一批<b>并行</b>跑；遇到写/编辑/执行类则先把已攒的只读批 flush 掉，再把这个写工具<b>单独串行</b>执行。
+     * 写工具天然成为屏障——夹在两次读之间的写会强制"读→写→读"的顺序，杜绝"读到的是写之前还是之后"的竞态。
+     *
+     * <p>结果按传入顺序返回，调用方可安全地按原 tool_call 顺序回灌消息历史。
+     * 只读批里某工具超过批次超时仍未返回，会取消并返回超时结果；已完成工具不受影响。
      */
     public List<ToolExecutionResult> executeTools(List<ToolInvocation> invocations) {
         if (invocations == null || invocations.isEmpty()) {
@@ -1917,12 +1932,47 @@ public class ToolRegistry {
                     .toList();
         }
         if (invocations.size() == 1) {
-            ToolInvocation invocation = invocations.get(0);
-            long startedAt = System.nanoTime();
-            ToolOutput output = executeToolOutput(invocation.name(), invocation.argumentsJson());
-            return List.of(ToolExecutionResult.completed(invocation, output, elapsedMillis(startedAt)));
+            return List.of(executeOneSerial(invocations.get(0)));
         }
 
+        List<ToolExecutionResult> results = new ArrayList<>(invocations.size());
+        List<ToolInvocation> readBatch = new ArrayList<>();
+        for (ToolInvocation invocation : invocations) {
+            if (isReadOnlyTool(invocation.name())) {
+                readBatch.add(invocation);
+                continue;
+            }
+            // 遇到写工具：先把已攒的只读批并行跑完（屏障），再串行执行这个写工具。
+            if (!readBatch.isEmpty()) {
+                results.addAll(executeReadOnlyBatch(readBatch));
+                readBatch.clear();
+            }
+            results.add(executeOneSerial(invocation));
+        }
+        // 收尾：末尾还攒着的只读批。
+        if (!readBatch.isEmpty()) {
+            results.addAll(executeReadOnlyBatch(readBatch));
+        }
+        return results;
+    }
+
+    /** 串行执行单个工具调用（写工具走这条；尊重取消）。 */
+    private ToolExecutionResult executeOneSerial(ToolInvocation invocation) {
+        if (CancellationContext.isCancelled()) {
+            return ToolExecutionResult.failed(invocation, "用户取消了此次工具调用");
+        }
+        long startedAt = System.nanoTime();
+        ToolOutput output = executeToolOutput(invocation.name(), invocation.argumentsJson());
+        return ToolExecutionResult.completed(invocation, output, elapsedMillis(startedAt));
+    }
+
+    /** 并行执行一批只读工具调用。结果按传入顺序返回。单个调用直接串行，不开线程池。 */
+    private List<ToolExecutionResult> executeReadOnlyBatch(List<ToolInvocation> batch) {
+        if (batch.size() == 1) {
+            return List.of(executeOneSerial(batch.get(0)));
+        }
+        // 防御性拷贝：调用方会 clear() 复用同一个 list，闭包按值捕获引用会读到被清空的内容。
+        List<ToolInvocation> invocations = List.copyOf(batch);
         int parallelism = Math.min(invocations.size(), MAX_PARALLEL_TOOLS);
         ExecutorService executor = Executors.newFixedThreadPool(parallelism, r -> {
             Thread thread = new Thread(r, "paicli-tool-executor");
