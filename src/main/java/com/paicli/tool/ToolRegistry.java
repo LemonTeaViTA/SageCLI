@@ -135,6 +135,10 @@ public class ToolRegistry {
     /** 一条待办：content（祈使态，"运行测试"）、activeForm（进行态，"正在运行测试"）、status（三态）。 */
     public record TodoItem(String content, String activeForm, String status) {}
 
+    // 后台命令管理器（execute_command 的 run_in_background 路径用）。会话级，projectPath 用 supplier 传以应对 setProjectPath 变更。
+    private final BackgroundCommandManager backgroundCommands =
+            new BackgroundCommandManager(this::getProjectPath);
+
     public ToolRegistry() {
         this(DEFAULT_COMMAND_TIMEOUT_SECONDS, DEFAULT_TOOL_BATCH_TIMEOUT_SECONDS);
     }
@@ -1030,9 +1034,33 @@ public class ToolRegistry {
     private void registerShellTools() {
         tools.put("execute_command", new Tool(
                 "execute_command",
-                "在当前项目目录中执行短时 Shell 命令（默认 60 秒超时，不允许全盘扫描）",
-                createParameters(new Param("command", "string", "要执行的命令", true)),
-                args -> executeCommand(args.get("command"))
+                "在当前项目目录中执行 Shell 命令（前台默认 60 秒超时，不允许全盘扫描）。"
+                        + "对长任务（build/测试/下载等）设 run_in_background=true：立即返回 task_id 不阻塞，"
+                        + "之后用 check_command 主动查询状态/输出（不要 sleep 轮询，先去做别的事再回来查），kill_command 终止。",
+                createParameters(
+                        new Param("command", "string", "要执行的命令", true),
+                        new Param("run_in_background", "boolean",
+                                "设为 true 在后台运行，立即返回 task_id 不阻塞；用于长任务。默认 false（前台同步执行）。", false)
+                ),
+                args -> executeCommand(args.get("command"),
+                        "true".equalsIgnoreCase(args.get("run_in_background")))
+        ));
+        tools.put("check_command", new Tool(
+                "check_command",
+                "查询后台命令（execute_command run_in_background 启动的）的状态与输出。"
+                        + "传 task_id 查单个；不传则列出全部后台任务概要。只读，不影响进程。",
+                createParameters(
+                        new Param("task_id", "string", "要查询的后台任务 ID；省略则列出全部", false)
+                ),
+                args -> backgroundCommands.check(args.get("task_id"))
+        ));
+        tools.put("kill_command", new Tool(
+                "kill_command",
+                "终止一个后台命令（先 SIGTERM，2 秒后仍在则 SIGKILL）。只能终止本会话启动的后台任务。",
+                createParameters(
+                        new Param("task_id", "string", "要终止的后台任务 ID", true)
+                ),
+                args -> backgroundCommands.kill(args.get("task_id"))
         ));
     }
 
@@ -1928,7 +1956,7 @@ public class ToolRegistry {
         }
     }
 
-    private String executeCommand(String command) {
+    private String executeCommand(String command, boolean runInBackground) {
         String normalized = command == null ? "" : command.trim();
         if (normalized.isEmpty()) {
             return "执行命令失败: 命令不能为空";
@@ -1936,8 +1964,13 @@ public class ToolRegistry {
         String denyReason = CommandGuard.check(normalized);
         if (denyReason != null) {
             // 抛 PolicyException 让外层 executeTool 统一写 audit 并格式化拒绝消息，
-            // 命令围栏与路径围栏的拒绝路径走同一个出口。
+            // 命令围栏与路径围栏的拒绝路径走同一个出口。后台路径同样先过围栏，不绕过。
             throw new PolicyException(denyReason);
+        }
+
+        // 后台路径：不阻塞，立即返回 task_id。CommandGuard 已在上面跑过，HITL 审批由 HitlToolRegistry 在更外层完成。
+        if (runInBackground) {
+            return backgroundCommands.launch(normalized);
         }
 
         ExecutorService outputReaderExecutor = Executors.newSingleThreadExecutor(r -> {
