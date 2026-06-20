@@ -306,6 +306,11 @@ public class ToolRegistry {
                                 + (MAX_WRITE_FILE_BYTES / 1024 / 1024) + "MB 上限");
                     }
                     Path safe = pathGuard.resolveSafe(path);
+                    // 失效检测（对齐 CC）：覆写已存在文件前确认模型看过且未被外部改动；新建放行。
+                    String staleErr = checkWriteStaleness(safe, path);
+                    if (staleErr != null) {
+                        return staleErr;
+                    }
                     String before = null;
                     try {
                         if (Files.exists(safe) && Files.isRegularFile(safe)) {
@@ -504,6 +509,48 @@ public class ToolRegistry {
         } catch (Exception e) {
             return file.toAbsolutePath().normalize().toString();
         }
+    }
+
+    /**
+     * write_file 覆写已存在文件前的失效检测（对齐 CC FileWriteTool.validateInput）。
+     *
+     * <p>write 比 edit 更需要这道闸：edit 有 old_string 当内容校验（匹配不上就拒），而 write 是整文件覆写、
+     * 无任何校验，盲目覆写会静默抹掉用户/linter 在这之间的改动。所以：
+     * <ul>
+     *   <li>文件不存在（新建）→ 放行（无内容可抹）。</li>
+     *   <li>已存在但台账里没读过 → 拦，要求先读（write 无 old_string 安全网，比 edit 的"免读直编"更该拦）。</li>
+     *   <li>已存在但只读过一段（带 offset/limit 的分页读）→ 拦：没看过整文件就整文件覆写，同样会抹掉没看到的部分（对齐 CC 的 isPartialView）。</li>
+     *   <li>已存在且整文件读过、但 mtime 变了 → 拦，要求重读。</li>
+     * </ul>
+     * 模型自己写过的文件，write/edit 成功后会 recordRead 刷新台账，故连续覆写不会被误拦。
+     *
+     * @return null 表示放行；非 null 是给模型看的拦截提示。
+     */
+    private String checkWriteStaleness(Path file, String displayPath) {
+        if (!Files.exists(file) || !Files.isRegularFile(file)) {
+            return null; // 新建，放行
+        }
+        ReadRecord prior = readFileState.get(canonicalKey(file));
+        if (prior == null) {
+            return "写入文件失败: " + displayPath + " 已存在但尚未读取。write_file 会整文件覆写，"
+                    + "为避免抹掉你尚未看到的内容，请先 read_file 确认当前内容再覆写。"
+                    + "（若只改局部，用 edit_file 更安全、更省 token。）";
+        }
+        // 只读过一段（分页读）不算看过整文件：整文件覆写会抹掉没读到的部分，要求完整读。
+        if (prior.offset() != null || prior.limit() != null) {
+            return "写入文件失败: " + displayPath + " 只读取过部分内容（带 offset/limit 的分页读），"
+                    + "未读过完整文件。write_file 会整文件覆写，请先完整 read_file（不带 offset/limit）"
+                    + "确认全部内容再覆写。（若只改局部，用 edit_file 更安全。）";
+        }
+        try {
+            if (Files.getLastModifiedTime(file).toMillis() != prior.mtimeMs()) {
+                return "写入文件失败: " + displayPath + " 自你上次 read_file 之后已被修改，"
+                        + "覆写会抹掉这些改动。请先重新 read_file 确认最新内容，再覆写。";
+            }
+        } catch (Exception ignored) {
+            // stat 失败不阻断写入主路径
+        }
+        return null;
     }
 
     /**
@@ -1336,7 +1383,7 @@ public class ToolRegistry {
                         + "中间翻过的大量文件内容不会进入你的上下文（省 token、不干扰主线）。"
                         + "适用：\"在整个项目里找 X 在哪/怎么实现的\"这类需要多轮 grep+read 的探索。"
                         + "不要用于：已知单个文件路径（直接 read_file）、找某个符号定义（直接 grep_code）、"
-                        + "只在 2-3 个文件内查看（直接 read_file）。子 agent 只能读、不能改���件。",
+                        + "只在 2-3 个文件内查看（直接 read_file）。子 agent 只能读、不能改文件。",
                 createParameters(
                         new Param("description", "string", "任务的 3-5 字概述", true),
                         new Param("prompt", "string", "给子 agent 的完整检索指令：要找什么、判断标准、希望回传什么结论", true)

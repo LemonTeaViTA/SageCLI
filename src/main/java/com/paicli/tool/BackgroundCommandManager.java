@@ -31,7 +31,7 @@ import java.util.function.Supplier;
  *   <li>ShutdownHook <b>懒注册</b>（首次启动后台任务才注册）→ 从不起后台的会话/测试零开销，且退出时杀光残留进程防僵尸。</li>
  * </ul>
  *
- * <p>安��：CommandGuard 检查与 HITL 审批在进入本类之前已由 ToolRegistry / HitlToolRegistry 完成
+ * <p>安全：CommandGuard 检查与 HITL 审批在进入本类之前已由 ToolRegistry / HitlToolRegistry 完成
  * （后台路径留在 execute_command 工具内，不另起工具），本类不重复也不绕过。
  */
 final class BackgroundCommandManager {
