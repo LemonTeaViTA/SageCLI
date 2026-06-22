@@ -206,19 +206,32 @@ public interface LlmClient {
     }
 
     record ChatResponse(String role, String content, String reasoningContent, List<ToolCall> toolCalls,
-                        int inputTokens, int outputTokens, int cachedInputTokens) {
+                        int inputTokens, int outputTokens, int cachedInputTokens, String finishReason) {
+        public ChatResponse(String role, String content, String reasoningContent, List<ToolCall> toolCalls,
+                            int inputTokens, int outputTokens, int cachedInputTokens) {
+            this(role, content, reasoningContent, toolCalls, inputTokens, outputTokens, cachedInputTokens, null);
+        }
+
         public ChatResponse(String role, String content, List<ToolCall> toolCalls,
                             int inputTokens, int outputTokens) {
-            this(role, content, null, toolCalls, inputTokens, outputTokens, 0);
+            this(role, content, null, toolCalls, inputTokens, outputTokens, 0, null);
         }
 
         public ChatResponse(String role, String content, String reasoningContent, List<ToolCall> toolCalls,
                             int inputTokens, int outputTokens) {
-            this(role, content, reasoningContent, toolCalls, inputTokens, outputTokens, 0);
+            this(role, content, reasoningContent, toolCalls, inputTokens, outputTokens, 0, null);
         }
 
         public boolean hasToolCalls() {
             return toolCalls != null && !toolCalls.isEmpty();
+        }
+
+        /**
+         * 输出是否因长度上限被截断（finish_reason=length，OpenAI 兼容口径）。
+         * 截断意味着 content 是残缺的半句话——绝不能当成最终回答直接返回给用户。
+         */
+        public boolean isTruncatedByLength() {
+            return "length".equals(finishReason);
         }
     }
 }

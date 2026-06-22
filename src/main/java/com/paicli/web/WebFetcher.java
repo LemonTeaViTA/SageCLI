@@ -45,6 +45,10 @@ public class WebFetcher {
                 .connectTimeout(10, TimeUnit.SECONDS)
                 .readTimeout(DEFAULT_TIMEOUT_SECONDS, TimeUnit.SECONDS)
                 .callTimeout(DEFAULT_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+                // 关掉 OkHttp 的自动重定向：跨域重定向若自动跟随，等于绕过上层的 SSRF 围栏
+                // （开放重定向 → 内网/钓鱼）。改由调用方逐跳过 NetworkPolicy 校验、跨域交模型决定。
+                .followRedirects(false)
+                .followSslRedirects(false)
                 .build());
     }
 
@@ -65,6 +69,18 @@ public class WebFetcher {
 
         log.info("web_fetch: GET {}", url);
         try (Response response = httpClient.newCall(request).execute()) {
+            // 3xx：不自动跟随，把目标 Location 回传给调用方逐跳校验（见类注释）。
+            if (response.isRedirect()) {
+                String location = response.header("Location");
+                if (location == null || location.isBlank()) {
+                    throw new IOException("HTTP " + response.code() + " 重定向但缺少 Location 头");
+                }
+                // Location 可能是相对路径，按当前 URL 解析成绝对地址。
+                String absolute = response.request().url().resolve(location) != null
+                        ? response.request().url().resolve(location).toString()
+                        : location;
+                return RawResponse.redirect(url, absolute, response.code());
+            }
             if (!response.isSuccessful()) {
                 throw new IOException("HTTP " + response.code() + " " + response.message());
             }
@@ -78,7 +94,7 @@ public class WebFetcher {
             boolean truncated = bytes.length >= maxBytes;
             String text = new String(bytes, charset);
             String contentType = response.header("Content-Type", "");
-            return new RawResponse(url, text, contentType, charset.name(), truncated);
+            return new RawResponse(url, text, contentType, charset.name(), truncated, null, 0);
         }
     }
 
@@ -112,5 +128,17 @@ public class WebFetcher {
         return out.toByteArray();
     }
 
-    public record RawResponse(String url, String body, String contentType, String charset, boolean truncated) {}
+    /**
+     * 抓取结果。普通响应填 body/contentType/charset；重定向响应 redirectLocation 非空、body 为空。
+     */
+    public record RawResponse(String url, String body, String contentType, String charset, boolean truncated,
+                              String redirectLocation, int redirectStatus) {
+        public boolean isRedirect() {
+            return redirectLocation != null && !redirectLocation.isBlank();
+        }
+
+        static RawResponse redirect(String fromUrl, String location, int status) {
+            return new RawResponse(fromUrl, "", "", StandardCharsets.UTF_8.name(), false, location, status);
+        }
+    }
 }

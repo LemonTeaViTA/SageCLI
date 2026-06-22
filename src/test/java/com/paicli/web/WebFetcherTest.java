@@ -90,6 +90,21 @@ class WebFetcherTest {
     }
 
     @Test
+    void redirectReturnsLocationInsteadOfFollowing() throws IOException {
+        // 3xx 不自动跟随：fetch 应回传 redirectLocation 供上层逐跳校验，而非自动打到目标。
+        server.enqueue(new MockResponse()
+                .setResponseCode(302)
+                .setHeader("Location", "https://example.com/other"));
+
+        WebFetcher fetcher = new WebFetcher();
+        WebFetcher.RawResponse raw = fetcher.fetch(server.url("/redir").toString());
+
+        assertTrue(raw.isRedirect(), "3xx 应标记为重定向");
+        assertEquals("https://example.com/other", raw.redirectLocation());
+        assertEquals(302, raw.redirectStatus());
+    }
+
+    @Test
     void respectsCharsetFromContentType() throws IOException {
         server.enqueue(new MockResponse()
                 .setHeader("Content-Type", "text/html; charset=utf-8")

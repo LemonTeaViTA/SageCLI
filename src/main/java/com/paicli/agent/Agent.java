@@ -191,6 +191,10 @@ public class Agent {
         AgentBudget budget = AgentBudget.fromLlmClient(llmClient);
         pushStatus(budget, startNanos, "running");
 
+        // 输出被长度上限截断（finish_reason=length）时的续写计数，防止"截了又续、续了又截"无限循环。
+        int truncationContinuations = 0;
+        final int maxTruncationContinuations = 3;
+
         // 主退出条件 = LLM 自己决定（不再调用工具就返回）；
         // budget 仅在 token 用尽 / 检测到死循环 / 超出硬轮数时兜底。
         while (true) {
@@ -237,6 +241,42 @@ public class Agent {
                 budget.recordTokens(response.inputTokens(), response.outputTokens(), response.cachedInputTokens());
                 pushStatus(budget, startNanos, "running");
 
+                // 截断续写：finish_reason=length 表示这次输出被长度上限切断，content 是半句话。
+                // 绝不能当成最终回答返回——把已生成的残段留进历史，让模型从断点接着写。
+                // 注意：截断且带 tool_calls 时，最后一个工具的 arguments 大概率是残缺 JSON，执行会出错；
+                // 这里统一走"丢掉本轮 tool_calls、只保留文本、请求续写"，把决策交回模型重组。
+                if (response.isTruncatedByLength()) {
+                    if (truncationContinuations >= maxTruncationContinuations) {
+                        log.warn("output truncated by length {} times, giving up continuation at iteration {}",
+                                truncationContinuations, iteration);
+                        // 已续写多次仍被截断：保留已生成内容并明确告知用户结果不完整，不再硬续。
+                        conversationHistory.add(LlmClient.Message.assistant(response.content()));
+                        memoryManager.addAssistantMessage(response.content());
+                        pushStatus(budget, startNanos, "idle");
+                        String warn = "\n\n⚠️ 输出多次达到长度上限仍未写完，以上内容可能不完整。"
+                                + "可让我针对剩余部分继续，或缩小单次任务范围。";
+                        if (streamRenderer.hasStreamedOutput()) {
+                            streamRenderer.finish();
+                            return warn.trim();
+                        }
+                        streamRenderer.clearThinkingPanel();
+                        return formatUserFacingResponse(reasoningTranscript.toString(),
+                                (response.content() == null ? "" : response.content()) + warn);
+                    }
+                    truncationContinuations++;
+                    log.info("output truncated by length at iteration {}, continuing ({}/{})",
+                            iteration, truncationContinuations, maxTruncationContinuations);
+                    appendReasoning(reasoningTranscript, response.reasoningContent());
+                    // 残缺文本进历史（assistant），不带 tool_calls；再用 user 指令请求无缝续写。
+                    conversationHistory.add(LlmClient.Message.assistant(
+                            response.reasoningContent(), response.content(), null));
+                    conversationHistory.add(LlmClient.Message.user(
+                            "你上一条回复因长度上限被截断了。请直接从被截断处接着写完，"
+                                    + "不要重复已经输出过的内容，也不要重新开头或道歉。"));
+                    streamRenderer.resetBetweenIterations();
+                    continue;
+                }
+
                 // 如果有工具调用
                 if (response.hasToolCalls()) {
                     appendReasoning(reasoningTranscript, response.reasoningContent());
@@ -266,8 +306,27 @@ public class Agent {
                     continue;
                 }
 
-                // 没有工具调用，直接返回结果
+                // 没有工具调用，检查是否是"假性完成"
                 appendReasoning(reasoningTranscript, response.reasoningContent());
+
+                // 假性完成检测：有 reasoning 但 content 为空或很短（≤5字符），可能是模型在等待确认
+                boolean suspectedIncomplete = (response.reasoningContent() != null && !response.reasoningContent().isEmpty())
+                        && (response.content() == null || response.content().trim().length() <= 5);
+
+                if (suspectedIncomplete && iteration < 3) {
+                    // 自动推动继续，避免"卡住"
+                    log.info("Detected potential incomplete response (reasoning={} chars, content={} chars), auto-continuing",
+                            response.reasoningContent().length(),
+                            response.content() == null ? 0 : response.content().length());
+                    conversationHistory.add(LlmClient.Message.assistant(
+                            response.reasoningContent(),
+                            response.content(),
+                            null
+                    ));
+                    conversationHistory.add(LlmClient.Message.user("请继续完成任务。"));
+                    continue;
+                }
+
                 conversationHistory.add(LlmClient.Message.assistant(response.content()));
 
                 // 存入记忆

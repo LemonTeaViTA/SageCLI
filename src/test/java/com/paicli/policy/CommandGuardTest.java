@@ -137,4 +137,37 @@ class CommandGuardTest {
             }
         }
     }
+
+    @Test
+    void rejectsDangerInCompoundCommand() {
+        // 危险命令藏在复合命令后段：逐子命令扫描应拦住。
+        assertNotNull(CommandGuard.check("ls && rm -rf ~"));
+        assertNotNull(CommandGuard.check("echo hi; sudo reboot"));
+        assertNotNull(CommandGuard.check("cd /tmp && mkfs.ext4 /dev/sda1"));
+        assertNotNull(CommandGuard.check("true || shutdown -h now"));
+    }
+
+    @Test
+    void allowsBenignCompoundCommand() {
+        // 各段都安全的复合命令应放行，不被误伤。
+        assertNull(CommandGuard.check("cd src && mvn -q compile && ls target"));
+        assertNull(CommandGuard.check("git add . && git commit -m 'wip'"));
+        // 子命令拆分：分号分隔的多条安全命令。
+        assertNull(CommandGuard.check("pwd; ls -la; git status"));
+    }
+
+    @Test
+    void doesNotSplitOperatorsInsideQuotes() {
+        // 引号内的 && / ; / | 不是 shell 操作符，不应触发拆分导致误判（这里整体仍是安全命令）。
+        assertNull(CommandGuard.check("echo 'a && b'"));
+        assertNull(CommandGuard.check("grep 'foo|bar' file.txt"));
+    }
+
+    @Test
+    void splitsSubcommandsForInspection() {
+        // 直接验证拆分器：复合命令拆成独立段。
+        java.util.List<String> segs = CommandGuard.splitSubcommands("ls -la && rm -rf ~ ; pwd");
+        assertEquals(3, segs.size(), "应拆成 3 段: " + segs);
+        assertTrue(segs.contains("rm -rf ~"), "应含危险段: " + segs);
+    }
 }

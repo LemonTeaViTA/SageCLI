@@ -1650,41 +1650,90 @@ public class ToolRegistry {
             return "URL 不能为空";
         }
         NetworkPolicy policy = networkPolicy();
-        String denyReason = policy.checkUrl(url);
-        if (denyReason != null) {
-            return "❌ 网络访问被拒绝: " + denyReason;
-        }
-        String rateReason = policy.acquire();
-        if (rateReason != null) {
-            return "❌ " + rateReason;
-        }
+
+        // http→https 升级：明文 http 易被中间人篡改/重定向，先尝试升级（对标 CC 的 http→https）。
+        String currentUrl = upgradeHttpToHttps(url.trim());
 
         try {
-            WebFetcher.RawResponse raw = webFetcher().fetch(url.trim());
-            HtmlExtractor.Extracted extracted = htmlExtractor().extract(raw.body(), raw.url());
-            String markdown = extracted.markdown();
-            int originalLength = markdown.length();
-
-            // 摘要模式：填了 prompt 且摘要 client 可用 → 用小模型按 prompt 浓缩正文，主模型只看结论（省 token）。
-            // 任一不满足（没 prompt / 没注入 client / 正文为空 / 调用异常）都降级到原文截断（同 dispatch_agent 降级思路）。
-            if (prompt != null && !prompt.isBlank() && webFetchSummaryClient != null && !markdown.isBlank()) {
-                String summary = summarizeFetchedContent(markdown, prompt);
-                if (summary != null) {
-                    return formatFetchSummary(raw.url(), extracted.title(), prompt, summary, originalLength);
+            // 重定向逐跳循环：每跳都过 SSRF 校验；同域自动跟随，跨域交还模型决定（不自动跟，防开放重定向）。
+            final int maxRedirects = 5;
+            for (int hop = 0; ; hop++) {
+                String denyReason = policy.checkUrl(currentUrl);
+                if (denyReason != null) {
+                    return "❌ 网络访问被拒绝: " + denyReason;
                 }
-                // summary==null 表示摘要失败，落到下面原文截断。
-            }
+                String rateReason = policy.acquire();
+                if (rateReason != null) {
+                    return "❌ " + rateReason;
+                }
 
-            boolean truncated = false;
-            if (maxChars > 0 && markdown.length() > maxChars) {
-                markdown = markdown.substring(0, maxChars);
-                truncated = true;
+                WebFetcher.RawResponse raw = webFetcher().fetch(currentUrl);
+                if (!raw.isRedirect()) {
+                    return renderFetchedBody(raw, prompt, maxChars);
+                }
+
+                // 命中重定向。
+                if (hop >= maxRedirects) {
+                    return "❌ 重定向次数过多（超过 " + maxRedirects + " 跳），已停止。最后目标: " + raw.redirectLocation();
+                }
+                String target = upgradeHttpToHttps(raw.redirectLocation());
+                if (!sameHost(currentUrl, target)) {
+                    // 跨域重定向：不自动跟，把目标交回模型——由它判断是否信任并显式再抓一次 web_fetch。
+                    return "🔀 检测到跨域重定向（HTTP " + raw.redirectStatus() + "），未自动跟随。\n"
+                            + "原始 URL: " + currentUrl + "\n"
+                            + "重定向目标: " + target + "\n"
+                            + "如确认该目标可信且确实需要，请对上面的重定向目标 URL 重新调用 web_fetch。";
+                }
+                // 同域重定向（含 http→https 自升级后的同主机跳转）：自动跟随。
+                currentUrl = target;
             }
-            FetchResult result = FetchResult.ok(raw.url(), extracted.title(), markdown, originalLength, truncated);
-            return formatFetchResult(result);
         } catch (Exception e) {
             return "抓取失败: " + e.getMessage();
         }
+    }
+
+    /** 把 http:// 升级为 https://（仅协议头，host/path 不动）。非 http 开头原样返回。 */
+    private static String upgradeHttpToHttps(String url) {
+        if (url != null && url.regionMatches(true, 0, "http://", 0, "http://".length())) {
+            return "https://" + url.substring("http://".length());
+        }
+        return url;
+    }
+
+    /** 两个 URL 是否同主机（忽略大小写）。解析失败时保守返回 false（当作跨域，交模型决定）。 */
+    private static boolean sameHost(String a, String b) {
+        try {
+            String ha = java.net.URI.create(a).getHost();
+            String hb = java.net.URI.create(b).getHost();
+            return ha != null && ha.equalsIgnoreCase(hb);
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    /** 把成功抓取的正文渲染成工具结果：摘要模式优先，否则原文截断。 */
+    private String renderFetchedBody(WebFetcher.RawResponse raw, String prompt, int maxChars) {
+        HtmlExtractor.Extracted extracted = htmlExtractor().extract(raw.body(), raw.url());
+        String markdown = extracted.markdown();
+        int originalLength = markdown.length();
+
+        // 摘要模式：填了 prompt 且摘要 client 可用 → 用小模型按 prompt 浓缩正文，主模型只看结论（省 token）。
+        // 任一不满足（没 prompt / 没注入 client / 正文为空 / 调用异常）都降级到原文截断（同 dispatch_agent 降级思路）。
+        if (prompt != null && !prompt.isBlank() && webFetchSummaryClient != null && !markdown.isBlank()) {
+            String summary = summarizeFetchedContent(markdown, prompt);
+            if (summary != null) {
+                return formatFetchSummary(raw.url(), extracted.title(), prompt, summary, originalLength);
+            }
+            // summary==null 表示摘要失败，落到下面原文截断。
+        }
+
+        boolean truncated = false;
+        if (maxChars > 0 && markdown.length() > maxChars) {
+            markdown = markdown.substring(0, maxChars);
+            truncated = true;
+        }
+        FetchResult result = FetchResult.ok(raw.url(), extracted.title(), markdown, originalLength, truncated);
+        return formatFetchResult(result);
     }
 
     /** 摘要喂给二级模型的正文输入上限：防 prompt 过长被 API 拒；对标 CC 的 MAX_MARKDOWN_LENGTH（取更保守值）。 */

@@ -1,5 +1,6 @@
 package com.paicli.policy;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.regex.Pattern;
 
@@ -62,14 +63,41 @@ public final class CommandGuard {
     /**
      * 校验命令是否安全。
      *
+     * 两层扫描：
+     * 1. 整条命令扫描（保底）：覆盖跨操作符的模式，如 fork bomb {@code :(){ :|:& };:}，
+     *    拆开后会被打散，必须在整条上匹配。
+     * 2. 逐子命令扫描（对齐 CC：复合命令按 {@code && || ; |} 及命令替换 {@code $(...)}/反引号 拆开，
+     *    每段独立过规则）：让带 {@code [^\n]*} 的规则（如 dd of=/dev/）不会跨 {@code ;} 误伤另一段命令，
+     *    也能精确报出是哪一段触发。
+     *
      * @return null 表示放行；非 null 字符串是拒绝原因，调用方包装成用户/LLM 可见的提示
      */
     public static String check(String command) {
         if (command == null || command.isBlank()) {
             return null;
         }
-        String normalized = command.replaceAll("\\s+", " ").trim();
+        // 第一层：整条命令（保底跨操作符模式）。
+        String whole = command.replaceAll("\\s+", " ").trim();
+        String wholeReason = matchRules(whole);
+        if (wholeReason != null) {
+            return wholeReason;
+        }
+        // 第二层：逐子命令。
+        for (String sub : splitSubcommands(command)) {
+            String normalized = sub.replaceAll("\\s+", " ").trim();
+            if (normalized.isEmpty()) {
+                continue;
+            }
+            String reason = matchRules(normalized);
+            if (reason != null) {
+                return reason;
+            }
+        }
+        return null;
+    }
 
+    /** 对单段已归一化的命令文本跑黑名单规则（含可关闭的凭证路径规则）。 */
+    private static String matchRules(String normalized) {
         for (DenyRule rule : RULES) {
             if (rule.pattern().matcher(normalized).find()) {
                 return rule.reason();
@@ -83,6 +111,86 @@ public final class CommandGuard {
             }
         }
         return null;
+    }
+
+    /**
+     * 把复合命令拆成子命令。拆分点：{@code && || ; | &} 和换行；引号内的操作符不拆。
+     * 命令替换 {@code $(...)} 与反引号 `...` 内的内容作为独立子命令递归拆出（它们也会被 shell 执行）。
+     * 这是 best-effort 拆分而非完整 shell 解析——目的是让黑名单逐段命中，不追求语法完备。
+     */
+    static List<String> splitSubcommands(String command) {
+        List<String> segments = new ArrayList<>();
+        StringBuilder cur = new StringBuilder();
+        char quote = 0;            // 当前所处引号：' 或 " 或 0（未在引号内）
+        for (int i = 0; i < command.length(); i++) {
+            char c = command.charAt(i);
+            if (quote != 0) {
+                if (c == quote) {
+                    quote = 0;
+                }
+                cur.append(c);
+                continue;
+            }
+            if (c == '\'' || c == '"') {
+                quote = c;
+                cur.append(c);
+                continue;
+            }
+            // 命令替换 $(...)：提取括号内内容作为独立段，递归拆分。
+            if (c == '$' && i + 1 < command.length() && command.charAt(i + 1) == '(') {
+                int depth = 1;
+                int j = i + 2;
+                StringBuilder inner = new StringBuilder();
+                while (j < command.length() && depth > 0) {
+                    char cj = command.charAt(j);
+                    if (cj == '(') depth++;
+                    else if (cj == ')') {
+                        depth--;
+                        if (depth == 0) break;
+                    }
+                    inner.append(cj);
+                    j++;
+                }
+                segments.addAll(splitSubcommands(inner.toString()));
+                i = j; // 跳过整个 $(...)
+                continue;
+            }
+            // 反引号 `...`：同样作为独立段。
+            if (c == '`') {
+                int j = i + 1;
+                StringBuilder inner = new StringBuilder();
+                while (j < command.length() && command.charAt(j) != '`') {
+                    inner.append(command.charAt(j));
+                    j++;
+                }
+                segments.addAll(splitSubcommands(inner.toString()));
+                i = j;
+                continue;
+            }
+            // 控制操作符：&& || ; | & 和换行。
+            if (c == ';' || c == '\n') {
+                flush(segments, cur);
+                continue;
+            }
+            if (c == '&' || c == '|') {
+                flush(segments, cur);
+                if (i + 1 < command.length() && command.charAt(i + 1) == c) {
+                    i++; // 吃掉成对的 && 或 ||
+                }
+                continue;
+            }
+            cur.append(c);
+        }
+        flush(segments, cur);
+        return segments;
+    }
+
+    private static void flush(List<String> segments, StringBuilder cur) {
+        String s = cur.toString().trim();
+        if (!s.isEmpty()) {
+            segments.add(s);
+        }
+        cur.setLength(0);
     }
 
     private static boolean sensitivePathGuardEnabled() {

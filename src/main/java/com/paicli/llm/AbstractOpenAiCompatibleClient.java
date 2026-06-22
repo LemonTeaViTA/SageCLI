@@ -147,6 +147,7 @@ public abstract class AbstractOpenAiCompatibleClient implements LlmClient {
             int inputTokens = 0;
             int outputTokens = 0;
             int cachedInputTokens = 0;
+            String finishReason = null;
 
             while (!source.exhausted()) {
                 String line = source.readUtf8Line();
@@ -181,6 +182,11 @@ public abstract class AbstractOpenAiCompatibleClient implements LlmClient {
                 }
 
                 JsonNode choice = choices.get(0);
+                // finish_reason 在每个 chunk 都可能为 null，只有结束 chunk 才有值；保留最后一个非空值。
+                String chunkFinish = choice.path("finish_reason").asText("");
+                if (!chunkFinish.isEmpty() && !"null".equals(chunkFinish)) {
+                    finishReason = chunkFinish;
+                }
                 JsonNode delta = choice.path("delta");
                 if (delta.isMissingNode() || delta.isNull()) {
                     delta = choice.path("message");
@@ -216,7 +222,8 @@ public abstract class AbstractOpenAiCompatibleClient implements LlmClient {
                     buildToolCalls(toolAccumulators),
                     inputTokens,
                     outputTokens,
-                    cachedInputTokens
+                    cachedInputTokens,
+                    finishReason
             );
         }
     }
