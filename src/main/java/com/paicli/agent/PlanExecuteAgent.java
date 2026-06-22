@@ -564,6 +564,8 @@ public class PlanExecuteAgent {
         int totalInputTokens = 0;
         int totalOutputTokens = 0;
         int totalCachedInputTokens = 0;
+        // per-model 成本账本：与 ReAct 路径口径一致，任务收尾并入会话账本。
+        com.paicli.cost.CostLedger runCostLedger = new com.paicli.cost.CostLedger();
 
         while (iteration < MAX_TASK_ITERATIONS) {
             if (CancellationContext.isCancelled()) {
@@ -593,6 +595,8 @@ public class PlanExecuteAgent {
             totalInputTokens += response.inputTokens();
             totalOutputTokens += response.outputTokens();
             totalCachedInputTokens += response.cachedInputTokens();
+            runCostLedger.record(llmClient, response.inputTokens(), response.outputTokens(),
+                    response.cachedInputTokens(), response.cacheCreationInputTokens());
 
             log.info("Task {} iteration {} response: toolCalls={}, reasoningChars={}, contentChars={}",
                     task.getId(),
@@ -603,6 +607,7 @@ public class PlanExecuteAgent {
 
             if (!response.hasToolCalls()) {
                 memoryManager.recordTokenUsage(totalInputTokens, totalOutputTokens, totalCachedInputTokens);
+                memoryManager.mergeCostLedger(runCostLedger);
                 if (!allResults.isEmpty() && (response.content() == null || response.content().isBlank())) {
                     String toolOnlyResult = allResults.toString().trim();
                     if (!toolOnlyResult.isBlank()) {

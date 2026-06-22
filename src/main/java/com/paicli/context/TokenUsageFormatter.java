@@ -34,11 +34,10 @@ public final class TokenUsageFormatter {
         if (pricing == null || !pricing.known()) {
             return "价格未知";  // 不冒充实价：未配/未知 series 时显式标注，提示用 config pricing 填实价
         }
+        // 复用 CostLedger 的统一成本公式（cacheCreation 传 0，与旧式等价）；避免两处各算一遍口径漂移。
         int cached = Math.max(0, Math.min(Math.max(0, inputTokens), cachedInputTokens));
-        int uncachedInput = Math.max(0, inputTokens) - cached;
-        double cny = (uncachedInput / 1_000_000.0) * pricing.inputPerMillion()
-                + (cached / 1_000_000.0) * pricing.effectiveCachedPerMillion()
-                + (Math.max(0, outputTokens) / 1_000_000.0) * pricing.outputPerMillion();
+        double cny = com.paicli.cost.CostLedger.costCny(
+                pricing, Math.max(0, inputTokens), Math.max(0, outputTokens), cached, 0);
         return String.format(Locale.ROOT, "¥%.4f", cny);
     }
 }

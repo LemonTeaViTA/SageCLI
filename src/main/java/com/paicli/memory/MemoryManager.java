@@ -2,6 +2,7 @@ package com.paicli.memory;
 
 import com.paicli.llm.LlmClient;
 import com.paicli.context.ContextProfile;
+import com.paicli.cost.CostLedger;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -25,6 +26,8 @@ public class MemoryManager {
     private TokenBudget tokenBudget;
     private ContextProfile contextProfile;
     private String currentProject;
+    // 会话级成本/token 账本（per-model）：跨多轮累计，/cost 与跨会话持久化的数据源。
+    private CostLedger costLedger = new CostLedger();
 
     public MemoryManager(LlmClient llmClient) {
         this(llmClient, ContextProfile.from(llmClient), null);
@@ -180,6 +183,23 @@ public class MemoryManager {
 
     public void recordTokenUsage(int inputTokens, int outputTokens, int cachedInputTokens) {
         tokenBudget.recordUsage(inputTokens, outputTokens, cachedInputTokens);
+    }
+
+    /** 会话级成本账本（per-model），/cost 与持久化的数据源。 */
+    public CostLedger getCostLedger() {
+        return costLedger;
+    }
+
+    /** 把一次 run 的成本账本并入会话账本（三条执行路径收尾调用）。 */
+    public void mergeCostLedger(CostLedger runLedger) {
+        if (runLedger != null) {
+            costLedger.merge(runLedger);
+        }
+    }
+
+    /** 恢复会话时灌回磁盘账本（/resume /continue 用）。 */
+    public void restoreCostLedger(CostLedger restored) {
+        this.costLedger = restored != null ? restored : new CostLedger();
     }
 
     /**

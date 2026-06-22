@@ -24,6 +24,7 @@
 - `ContextProfile` 按模型窗口派生上下文预算——**压缩触发点 = 窗口 − 摘要输出预留 − 缓冲**，直接锁定「触发时仍可用的绝对 token 余量」而非固定比率，避免大窗口浪费、小窗口溢出。
 - 占用达阈值时自动将早期对话摘要压缩为一段、保留最近 N 轮原文（`ConversationHistoryCompactor`）。
 - prompt cache 命中可见化 + 按模型 series 分档的调用成本估算。
+- 可观测性账本（`CostLedger`）：按模型分用量、区分 cache_read（读缓存命中）与 cache_creation（写缓存），跨会话独立 sidecar 持久化；`/cost` 查看本会话与项目历史成本。
 
 ### 记忆系统
 
@@ -169,7 +170,7 @@ java -jar target/sagecli-1.0-SNAPSHOT.jar
 | `/sessions` `/resume <id>` `/continue` | 会话历史与恢复 |
 | `/init [--force]` | 生成项目级记忆 PAI.md |
 | `/policy` `/audit [N]` | 查看安全策略 / 审计记录 |
-| `/context` `/config` `/clear` `/help` `/exit` | 上下文状态 / 配置 / 清空 / 帮助 / 退出 |
+| `/context` `/cost` `/config` `/clear` `/help` `/exit` | 上下文状态 / 成本账本 / 配置 / 清空 / 帮助 / 退出 |
 
 ## 技术栈
 

@@ -147,6 +147,7 @@ public abstract class AbstractOpenAiCompatibleClient implements LlmClient {
             int inputTokens = 0;
             int outputTokens = 0;
             int cachedInputTokens = 0;
+            int cacheCreationInputTokens = 0;
             String finishReason = null;
 
             while (!source.exhausted()) {
@@ -174,6 +175,7 @@ public abstract class AbstractOpenAiCompatibleClient implements LlmClient {
                     inputTokens = usage.path("prompt_tokens").asInt(inputTokens);
                     outputTokens = usage.path("completion_tokens").asInt(outputTokens);
                     cachedInputTokens = parseCachedInputTokens(usage, cachedInputTokens);
+                    cacheCreationInputTokens = parseCacheCreationTokens(usage, cacheCreationInputTokens);
                 }
 
                 JsonNode choices = root.path("choices");
@@ -223,7 +225,8 @@ public abstract class AbstractOpenAiCompatibleClient implements LlmClient {
                     inputTokens,
                     outputTokens,
                     cachedInputTokens,
-                    finishReason
+                    finishReason,
+                    cacheCreationInputTokens
             );
         }
     }
@@ -267,6 +270,22 @@ public abstract class AbstractOpenAiCompatibleClient implements LlmClient {
             cached = inputDetails.path("cached_tokens").asInt(cached);
         }
         return cached;
+    }
+
+    /**
+     * 解析"写缓存"（首次建立前缀缓存）的 input token。
+     *
+     * <p>区别于 {@link #parseCachedInputTokens}（命中读缓存）：写缓存量高说明缓存在反复重建、命中差。
+     * 多数 OpenAI 兼容平台不返回该字段，缺省即 0；Anthropic 口径用 {@code cache_creation_input_tokens}，
+     * 部分平台放在 {@code prompt_tokens_details.cache_creation_tokens}。
+     */
+    private int parseCacheCreationTokens(JsonNode usage, int fallback) {
+        int created = usage.path("cache_creation_input_tokens").asInt(fallback);
+        JsonNode promptDetails = usage.path("prompt_tokens_details");
+        if (!promptDetails.isMissingNode()) {
+            created = promptDetails.path("cache_creation_tokens").asInt(created);
+        }
+        return created;
     }
 
     private ObjectNode buildRequestBody(List<Message> messages, List<Tool> tools) {

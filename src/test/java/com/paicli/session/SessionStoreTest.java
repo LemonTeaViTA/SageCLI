@@ -117,4 +117,65 @@ class SessionStoreTest {
     void loadMissingSessionReturnsEmpty() {
         assertTrue(store().loadSession("/proj/none", "session_does_not_exist").isEmpty());
     }
+
+    @Test
+    void costLedgerSidecarRoundTrips() {
+        SessionStore store = store();
+        String project = "/proj/cost";
+        String sid = SessionStore.generateSessionId(6000L);
+
+        com.paicli.cost.CostLedger ledger = new com.paicli.cost.CostLedger();
+        ledger.record(client("glm-x", new com.paicli.llm.SeriesQuirks.Pricing(2.0, 0.5, 8.0)),
+                1_000_000, 500_000, 200_000, 100_000);
+        store.saveCostLedger(project, sid, ledger);
+
+        com.paicli.cost.CostLedger loaded = store.loadCostLedger(project, sid);
+        assertEquals(1_000_000, loaded.totalInputTokens());
+        assertEquals(500_000, loaded.totalOutputTokens());
+        assertEquals(200_000, loaded.totalCacheReadTokens());
+        assertEquals(100_000, loaded.totalCacheCreationTokens());
+        assertEquals(ledger.totalCostCny(), loaded.totalCostCny(), 1e-9);
+    }
+
+    @Test
+    void loadMissingCostLedgerReturnsEmptyNotNull() {
+        com.paicli.cost.CostLedger loaded = store().loadCostLedger("/proj/none", "session_x");
+        assertNotNull(loaded);
+        assertTrue(loaded.isEmpty());
+    }
+
+    @Test
+    void emptyCostLedgerNotPersisted() {
+        SessionStore store = store();
+        store.saveCostLedger("/proj/empty", "session_e", new com.paicli.cost.CostLedger());
+        assertTrue(store.loadCostLedger("/proj/empty", "session_e").isEmpty());
+    }
+
+    @Test
+    void aggregateProjectCostMergesAllSessions() {
+        SessionStore store = store();
+        String project = "/proj/agg";
+        com.paicli.llm.SeriesQuirks.Pricing pricing = new com.paicli.llm.SeriesQuirks.Pricing(2.0, 0.5, 8.0);
+
+        com.paicli.cost.CostLedger s1 = new com.paicli.cost.CostLedger();
+        s1.record(client("m", pricing), 1_000_000, 0, 0, 0);
+        store.saveCostLedger(project, SessionStore.generateSessionId(7000L), s1);
+
+        com.paicli.cost.CostLedger s2 = new com.paicli.cost.CostLedger();
+        s2.record(client("m", pricing), 500_000, 0, 0, 0);
+        store.saveCostLedger(project, SessionStore.generateSessionId(7001L), s2);
+
+        com.paicli.cost.CostLedger total = store.aggregateProjectCost(project);
+        assertEquals(1_500_000, total.totalInputTokens());
+        assertEquals(1, total.models().size(), "同模型应合并为一桶");
+    }
+
+    private static com.paicli.llm.OpenAiCompatibleClient client(
+            String model, com.paicli.llm.SeriesQuirks.Pricing pricing) {
+        com.paicli.llm.SeriesQuirks quirks = new com.paicli.llm.SeriesQuirks(
+                model, "https://example.invalid/v1", 128_000, true, "test-cache",
+                false, null, null, pricing, true);
+        return new com.paicli.llm.OpenAiCompatibleClient(
+                "k", model, "https://example.invalid/v1", model, 0, quirks);
+    }
 }

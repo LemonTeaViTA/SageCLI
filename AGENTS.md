@@ -51,6 +51,8 @@ plan 单任务连续失败保护：`PlanExecuteAgent` 连续 N 轮（默认 2，
 
 会话恢复：对话按项目分组持久化到 `~/.paicli/sessions/<projectHash>/<sessionId>.jsonl`（存全 toolCalls/toolCallId，恢复后协议正确）；`/sessions` 列表、`/resume <id>` 恢复指定、`/continue` 接最近一次。恢复经 `Agent.restoreConversationHistory()`，会同步重建 MemoryManager 短期记忆。
 
+可观测性账本：成本/token 账本从 `AgentBudget` 抽离到 `cost/CostLedger`（按模型分桶，区分 cache_read 读缓存命中 vs cache_creation 写缓存），跨会话独立 sidecar `~/.paicli/sessions/<projectHash>/<sessionId>.cost.json` 持久化（与 message JSONL 分离，后者要无损重放给 LLM）。三条执行路径（Agent/PlanExecuteAgent/SubAgent）收尾把本 run 账本 merge 进 MemoryManager 会话账本；`/cost` 看本会话 per-model 明细 + 项目历史聚合。定价为占位/参考值，实际计费以平台账单为准、可用 config pricing 覆盖。
+
 核心内置工具 12 个：`read_file` / `write_file` / `edit_file` / `list_dir` / `glob_files` / `grep_code` / `execute_command` / `create_project` / `search_code` / `web_search` / `web_fetch` / `revert_turn`
 
 代码库理解默认走 Claude Code 式实时探索：`glob_files` 找候选文件、`grep_code` 精确定位符号或字符串、`read_file` 按需读取具体行段、`edit_file` 局部 str_replace 式修改已有文件（优先于 write_file 整文件覆写）。`search_code` 是 RAG 语义辅助，适合模糊自然语言、关键词不明确、常规搜索无果、巨型/跨知识检索场景，不作为精确代码定位的首选。
@@ -67,6 +69,7 @@ src/main/java/com/paicli/
 ├── llm/         GLMClient, DeepSeekClient, StepClient, KimiClient, QwenClient
 ├── session/     SessionStore, SessionMessageRecord（会话无损持久化与 /resume /continue 恢复，按项目分组）
 ├── context/     ContextProfile, ContextMode, TokenUsageFormatter
+├── cost/        CostLedger, ModelUsage, CostSnapshot（可观测性账本：per-model 成本/token，跨会话 sidecar 持久化）
 ├── memory/      MemoryManager, ConversationHistoryCompactor, LongTermMemory
 ├── plan/        Planner, ExecutionPlan, Task
 ├── rag/         CodeIndex, CodeRetriever, VectorStore, CodeChunker

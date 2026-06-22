@@ -115,6 +115,14 @@ class CliCommandParserTest {
     }
 
     @Test
+    void parsesCostSlashCommand() {
+        CliCommandParser.ParsedCommand command = CliCommandParser.parse("/cost");
+
+        assertEquals(CliCommandParser.CommandType.COST_STATUS, command.type());
+        assertNull(command.payload());
+    }
+
+    @Test
     void parsesHistoryClearSlashCommand() {
         CliCommandParser.ParsedCommand command = CliCommandParser.parse("/history clear");
 

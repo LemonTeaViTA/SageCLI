@@ -316,9 +316,9 @@ public class Main {
                 LlmClient dedicated = LlmClientFactory.create(summaryProvider.trim(), config);
                 if (dedicated != null) {
                     webFetchSummaryClient = dedicated;
-                    out.println("🔍 web_fetch 摘要使用独立模型: " + dedicated.getDisplayName());
+                    ui.println("🔍 web_fetch 摘要使用独立模型: " + dedicated.getDisplayName());
                 } else {
-                    out.println("⚠️ webFetchSummaryProvider=\"" + summaryProvider
+                    ui.println("⚠️ webFetchSummaryProvider=\"" + summaryProvider
                             + "\" 未能创建（缺 key/配置？），web_fetch 摘要退回使用主模型");
                 }
             }
@@ -437,6 +437,13 @@ public class Main {
                     case CONTEXT_STATUS -> {
                         ui.println("📋 上下文状态：");
                         ui.println(reactAgent.getContextStatus());
+                        ui.println();
+                        continue;
+                    }
+                    case COST_STATUS -> {
+                        ui.println(formatCostReport(
+                                reactAgent.getMemoryManager().getCostLedger(),
+                                sessionStore.aggregateProjectCost(sessionProjectKey)));
                         ui.println();
                         continue;
                     }
@@ -844,6 +851,9 @@ public class Main {
                 }
                 persistTurn(sessionStore, sessionProjectKey, currentSessionId[0],
                         reactAgent, historySizeBefore, taskInput, response, snapshotMode);
+                // 成本账本独立 sidecar 持久化（跨会话恢复成本状态）；与 message JSONL 分离避免污染重放。
+                sessionStore.saveCostLedger(sessionProjectKey, currentSessionId[0],
+                        reactAgent.getMemoryManager().getCostLedger());
                 if (response != null && !response.isBlank()) {
                     ui.println(response);
                     ui.println();
@@ -1417,6 +1427,7 @@ public class Main {
                 new SlashCommandHint("/clear", "/clear", "清空当前对话历史"),
                 new SlashCommandHint("/history clear", "/history clear", "清空本机输入历史"),
                 new SlashCommandHint("/context", "/context", "查看上下文和记忆状态"),
+                new SlashCommandHint("/cost", "/cost", "查看本会话与项目历史的成本/token 账本"),
                 new SlashCommandHint("/memory", "/memory", "查看记忆状态"),
                 new SlashCommandHint("/memory list", "/memory list", "查看长期记忆列表"),
                 new SlashCommandHint("/memory search ", "/memory search <关键词>", "搜索当前项目可见长期记忆"),
@@ -1481,6 +1492,83 @@ public class Main {
         }
     }
 
+    /**
+     * 渲染 /cost 报表：本会话 per-model 明细 + 项目历史聚合。
+     *
+     * <p>对照 CC-可观测性的「① 成本/token 账本」：按模型分用量、区分 cache_read（命中读缓存）与
+     * cache_creation（首次写缓存）。价格未知的模型成本列显式标注，不冒充实价。
+     */
+    private static String formatCostReport(com.paicli.cost.CostLedger session,
+                                           com.paicli.cost.CostLedger projectTotal) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("💰 成本 / Token 账本\n\n");
+        sb.append("本会话（按模型）：\n");
+        if (session == null || session.isEmpty()) {
+            sb.append("  （本会话还没有 LLM 调用）\n");
+        } else {
+            for (com.paicli.cost.ModelUsage u : session.models()) {
+                sb.append(formatModelCostLine(u));
+            }
+            sb.append("  ────────────────────────────────\n");
+            sb.append(String.format(java.util.Locale.ROOT,
+                    "  合计: 调用 %d 次 | 输入 %s | 输出 %s | cache读 %s | cache写 %s | %s\n",
+                    session.totalCallCount(),
+                    formatTokens(session.totalInputTokens()),
+                    formatTokens(session.totalOutputTokens()),
+                    formatTokens(session.totalCacheReadTokens()),
+                    formatTokens(session.totalCacheCreationTokens()),
+                    formatCostCny(session.totalCostCny())));
+        }
+        sb.append("\n项目历史聚合（全部会话）：\n");
+        if (projectTotal == null || projectTotal.isEmpty()) {
+            sb.append("  （暂无历史成本记录）\n");
+        } else {
+            sb.append(String.format(java.util.Locale.ROOT,
+                    "  调用 %d 次 | 输入 %s | 输出 %s | cache读 %s | cache写 %s | %s\n",
+                    projectTotal.totalCallCount(),
+                    formatTokens(projectTotal.totalInputTokens()),
+                    formatTokens(projectTotal.totalOutputTokens()),
+                    formatTokens(projectTotal.totalCacheReadTokens()),
+                    formatTokens(projectTotal.totalCacheCreationTokens()),
+                    formatCostCny(projectTotal.totalCostCny())));
+        }
+        sb.append("\n  注：定价为占位/参考值，实���计费以平台账单为准；写缓存暂按输入价估算。");
+        return sb.toString();
+    }
+
+    private static String formatModelCostLine(com.paicli.cost.ModelUsage u) {
+        return String.format(java.util.Locale.ROOT,
+                "  %-20s 调用 %d 次 | 输入 %s | 输出 %s | cache读 %s | cache写 %s | %s\n",
+                truncate(u.displayName(), 20),
+                u.callCount(),
+                formatTokens(u.inputTokens()),
+                formatTokens(u.outputTokens()),
+                formatTokens(u.cacheReadTokens()),
+                formatTokens(u.cacheCreationTokens()),
+                u.priceKnown() ? String.format(java.util.Locale.ROOT, "¥%.4f", u.costCny()) : "价格未知");
+    }
+
+    private static String formatCostCny(double cny) {
+        return cny < 0 ? "价格未知" : String.format(java.util.Locale.ROOT, "¥%.4f", cny);
+    }
+
+    private static String formatTokens(long tokens) {
+        if (tokens >= 1_000_000) {
+            return String.format(java.util.Locale.ROOT, "%.1fM", tokens / 1_000_000.0);
+        }
+        if (tokens >= 1_000) {
+            return String.format(java.util.Locale.ROOT, "%.1fk", tokens / 1_000.0);
+        }
+        return Long.toString(tokens);
+    }
+
+    private static String truncate(String s, int max) {
+        if (s == null) {
+            return "";
+        }
+        return s.length() <= max ? s : s.substring(0, max - 1) + "…";
+    }
+
     private static void printSessionList(PrintStream out, SessionStore sessionStore, String projectKey) {
         List<SessionStore.SessionMeta> sessions = sessionStore.listSessions(projectKey);
         if (sessions.isEmpty()) {
@@ -1520,6 +1608,9 @@ public class Main {
             messages.add(record.toMessage());
         }
         reactAgent.restoreConversationHistory(messages);
+        // 恢复成本账本：把磁盘 sidecar 灌回会话账本，/cost 能接上历史成本。
+        reactAgent.getMemoryManager().restoreCostLedger(
+                sessionStore.loadCostLedger(projectKey, sessionId));
         out.println("↩️ 已恢复会话 " + sessionId + "（" + records.size() + " 条消息），可继续对话。\n");
         return sessionId;
     }

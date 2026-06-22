@@ -2,6 +2,7 @@ package com.paicli.agent;
 
 import com.paicli.llm.LlmClient;
 import com.paicli.context.ContextProfile;
+import com.paicli.cost.CostLedger;
 
 import java.util.ArrayDeque;
 import java.util.Deque;
@@ -48,12 +49,16 @@ public class AgentBudget {
 
     private final Deque<String> recentToolSignatures = new ArrayDeque<>();
     private int iteration;
-    private int totalInputTokens;
-    private int totalOutputTokens;
-    private int totalCachedInputTokens;
+    // token / 成本累计抽离到 CostLedger（可观测性账本的 per-model 维度）；AgentBudget 只用它做兜底计数。
+    private final LlmClient llmClient;
+    private final CostLedger costLedger = new CostLedger();
     private boolean stagnant;
 
     public AgentBudget(int tokenBudget, int stagnationWindow, int hardMaxIterations) {
+        this(tokenBudget, stagnationWindow, hardMaxIterations, null);
+    }
+
+    public AgentBudget(int tokenBudget, int stagnationWindow, int hardMaxIterations, LlmClient llmClient) {
         if (tokenBudget <= 0) {
             throw new IllegalArgumentException("tokenBudget must be positive");
         }
@@ -66,6 +71,7 @@ public class AgentBudget {
         this.tokenBudget = tokenBudget;
         this.stagnationWindow = stagnationWindow;
         this.hardMaxIterations = hardMaxIterations;
+        this.llmClient = llmClient;
     }
 
     public static AgentBudget fromSystemProperties() {
@@ -89,10 +95,12 @@ public class AgentBudget {
         // ContextProfile 仍按 80% × window 计算 agentTokenBudget，用于 /context 与 token stats 的"软提示"显示；
         // 但 AgentBudget 的硬限默认走 Integer.MAX_VALUE，避免长上下文 + 套餐用户被预算墙卡住。
         // 显式 -Dpaicli.react.token.budget=N 仍可启用硬预算，覆盖默认。
+        // 传入 llmClient 让内部 CostLedger 能按模型分桶 + 取实时定价。
         return new AgentBudget(
                 readIntProperty("paicli.react.token.budget", Integer.MAX_VALUE),
                 readIntProperty("paicli.react.stagnation.window", DEFAULT_STAGNATION_WINDOW),
-                readIntProperty("paicli.react.hard.max.iterations", DEFAULT_HARD_MAX_ITERATIONS)
+                readIntProperty("paicli.react.hard.max.iterations", DEFAULT_HARD_MAX_ITERATIONS),
+                llmClient
         );
     }
 
@@ -102,13 +110,15 @@ public class AgentBudget {
     }
 
     public void recordTokens(int inputTokens, int outputTokens) {
-        recordTokens(inputTokens, outputTokens, 0);
+        recordTokens(inputTokens, outputTokens, 0, 0);
     }
 
     public void recordTokens(int inputTokens, int outputTokens, int cachedInputTokens) {
-        this.totalInputTokens += Math.max(0, inputTokens);
-        this.totalOutputTokens += Math.max(0, outputTokens);
-        this.totalCachedInputTokens += Math.max(0, cachedInputTokens);
+        recordTokens(inputTokens, outputTokens, cachedInputTokens, 0);
+    }
+
+    public void recordTokens(int inputTokens, int outputTokens, int cachedInputTokens, int cacheCreationInputTokens) {
+        costLedger.record(llmClient, inputTokens, outputTokens, cachedInputTokens, cacheCreationInputTokens);
     }
 
     /**
@@ -137,7 +147,7 @@ public class AgentBudget {
         if (stagnant) {
             return ExitReason.STAGNATION_DETECTED;
         }
-        if (totalInputTokens + totalOutputTokens >= tokenBudget) {
+        if (totalInputTokens() + totalOutputTokens() >= tokenBudget) {
             return ExitReason.TOKEN_BUDGET_EXCEEDED;
         }
         if (iteration >= hardMaxIterations) {
@@ -150,16 +160,25 @@ public class AgentBudget {
         return iteration;
     }
 
+    /** 本 run 的成本/token 账本（per-model），run 结束 merge 进会话账本。 */
+    public CostLedger costLedger() {
+        return costLedger;
+    }
+
     public int totalInputTokens() {
-        return totalInputTokens;
+        return (int) Math.min(Integer.MAX_VALUE, costLedger.totalInputTokens());
     }
 
     public int totalOutputTokens() {
-        return totalOutputTokens;
+        return (int) Math.min(Integer.MAX_VALUE, costLedger.totalOutputTokens());
     }
 
     public int totalCachedInputTokens() {
-        return totalCachedInputTokens;
+        return (int) Math.min(Integer.MAX_VALUE, costLedger.totalCacheReadTokens());
+    }
+
+    public int totalCacheCreationInputTokens() {
+        return (int) Math.min(Integer.MAX_VALUE, costLedger.totalCacheCreationTokens());
     }
 
     public int tokenBudget() {
@@ -179,7 +198,7 @@ public class AgentBudget {
             case WITHIN_BUDGET -> "未触发兜底条件";
             case TOKEN_BUDGET_EXCEEDED -> String.format(Locale.ROOT,
                     "Token 预算已用尽（%d / %d），任务被强制收尾",
-                    totalInputTokens + totalOutputTokens, tokenBudget);
+                    totalInputTokens() + totalOutputTokens(), tokenBudget);
             case STAGNATION_DETECTED -> String.format(Locale.ROOT,
                     "检测到连续 %d 轮重复的工具调用，疑似死循环，已强制收尾",
                     stagnationWindow);

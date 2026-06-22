@@ -54,6 +54,8 @@ public class SubAgent {
     // 工具白名单：null=用全部工具；非 null=只暴露并允许执行这些工具。
     // 用途：dispatch_agent 派生的检索子 agent 只给只读检索工具，且不含 dispatch_agent 本身（防递归）。
     private java.util.Set<String> allowedToolNames;
+    // 本子 agent 跨多次 run/execute 累计的成本账本（per-model）；orchestrator 收尾并入会话账本。
+    private final com.paicli.cost.CostLedger costLedger = new com.paicli.cost.CostLedger();
 
     public SubAgent(String name, AgentRole role, LlmClient llmClient, ToolRegistry toolRegistry) {
         this.name = name;
@@ -65,8 +67,7 @@ public class SubAgent {
         this.conversationHistory.add(LlmClient.Message.system(getSystemPrompt()));
     }
 
-    public void setExternalContextSupplier(Supplier<String> externalContextSupplier) {
-        this.externalContextSupplier = externalContextSupplier == null ? () -> "" : externalContextSupplier;
+    public void setExternalContextSupplier(Supplier<String> externalContextSupplier) {        this.externalContextSupplier = externalContextSupplier == null ? () -> "" : externalContextSupplier;
         refreshSystemPrompt();
     }
 
@@ -77,6 +78,11 @@ public class SubAgent {
 
     public void setSkillContextBuffer(SkillContextBuffer skillContextBuffer) {
         this.skillContextBuffer = skillContextBuffer;
+    }
+
+    /** 本子 agent 累计的成本账本（per-model）；orchestrator 收尾并入会话账本。 */
+    public com.paicli.cost.CostLedger getCostLedger() {
+        return costLedger;
     }
 
     /**
@@ -212,7 +218,10 @@ public class SubAgent {
                         llmClient,
                         response.reasoningContent());
 
-                budget.recordTokens(response.inputTokens(), response.outputTokens(), response.cachedInputTokens());
+                budget.recordTokens(response.inputTokens(), response.outputTokens(),
+                        response.cachedInputTokens(), response.cacheCreationInputTokens());
+                costLedger.record(llmClient, response.inputTokens(), response.outputTokens(),
+                        response.cachedInputTokens(), response.cacheCreationInputTokens());
 
                 if (response.hasToolCalls()) {
                     budget.recordToolCalls(response.toolCalls());

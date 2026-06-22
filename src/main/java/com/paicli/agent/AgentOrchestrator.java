@@ -54,6 +54,8 @@ public class AgentOrchestrator {
     private final ToolRegistry toolRegistry;
     private final PrintStream out;
     private Supplier<String> externalContextSupplier = () -> "";
+    // 并行批次里 short-lived localReviewer 的成本汇聚点；多 worker 线程并发 merge，需加锁。
+    private final com.paicli.cost.CostLedger parallelCostLedger = new com.paicli.cost.CostLedger();
 
     // 执行步骤的数据结构（package-private 供测试访问）
     record ExecutionStep(String id, String description, String type,
@@ -224,8 +226,21 @@ public class AgentOrchestrator {
         // 6. 汇总结果
         String finalResult = buildFinalResult(steps);
         memoryManager.addAssistantMessage("[多Agent结果] " + finalResult);
+        mergeAllCostLedgers();
 
         return finalResult;
+    }
+
+    /** 把 planner/workers/reviewer + 并行 localReviewer 的成本账本全部并入会话账本（per-model）。 */
+    private void mergeAllCostLedgers() {
+        memoryManager.mergeCostLedger(planner.getCostLedger());
+        for (SubAgent worker : workers) {
+            memoryManager.mergeCostLedger(worker.getCostLedger());
+        }
+        memoryManager.mergeCostLedger(reviewer.getCostLedger());
+        synchronized (parallelCostLedger) {
+            memoryManager.mergeCostLedger(parallelCostLedger);
+        }
     }
 
     /**
@@ -456,6 +471,10 @@ public class AgentOrchestrator {
                     if (worker != null) {
                         worker.clearHistory();
                         workerPool.offer(worker);
+                    }
+                    // localReviewer 是 short-lived 实例，账本随它消失前先汇聚到 orchestrator（多线程并发，加锁）。
+                    synchronized (parallelCostLedger) {
+                        parallelCostLedger.merge(localReviewer.getCostLedger());
                     }
                     stepOut.flush();
                 }

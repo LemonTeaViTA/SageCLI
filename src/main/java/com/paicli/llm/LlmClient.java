@@ -206,20 +206,27 @@ public interface LlmClient {
     }
 
     record ChatResponse(String role, String content, String reasoningContent, List<ToolCall> toolCalls,
-                        int inputTokens, int outputTokens, int cachedInputTokens, String finishReason) {
+                        int inputTokens, int outputTokens, int cachedInputTokens, String finishReason,
+                        int cacheCreationInputTokens) {
+        public ChatResponse(String role, String content, String reasoningContent, List<ToolCall> toolCalls,
+                            int inputTokens, int outputTokens, int cachedInputTokens, String finishReason) {
+            this(role, content, reasoningContent, toolCalls, inputTokens, outputTokens, cachedInputTokens,
+                    finishReason, 0);
+        }
+
         public ChatResponse(String role, String content, String reasoningContent, List<ToolCall> toolCalls,
                             int inputTokens, int outputTokens, int cachedInputTokens) {
-            this(role, content, reasoningContent, toolCalls, inputTokens, outputTokens, cachedInputTokens, null);
+            this(role, content, reasoningContent, toolCalls, inputTokens, outputTokens, cachedInputTokens, null, 0);
         }
 
         public ChatResponse(String role, String content, List<ToolCall> toolCalls,
                             int inputTokens, int outputTokens) {
-            this(role, content, null, toolCalls, inputTokens, outputTokens, 0, null);
+            this(role, content, null, toolCalls, inputTokens, outputTokens, 0, null, 0);
         }
 
         public ChatResponse(String role, String content, String reasoningContent, List<ToolCall> toolCalls,
                             int inputTokens, int outputTokens) {
-            this(role, content, reasoningContent, toolCalls, inputTokens, outputTokens, 0, null);
+            this(role, content, reasoningContent, toolCalls, inputTokens, outputTokens, 0, null, 0);
         }
 
         public boolean hasToolCalls() {

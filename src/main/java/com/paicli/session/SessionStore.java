@@ -1,6 +1,8 @@
 package com.paicli.session;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.paicli.cost.CostLedger;
+import com.paicli.cost.CostSnapshot;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -101,6 +103,65 @@ public class SessionStore {
         return messages;
     }
 
+    /**
+     * 保存会话成本账本到 sidecar：{@code <projectHash>/<sessionId>.cost.json}。
+     *
+     * <p>独立于 message JSONL —— 后者要无损重放给 LLM，混入累计成本会污染重放语义。
+     * 账本单独存，项目历史聚合时也只需扫 {@code *.cost.json}。空账本不落盘。
+     */
+    public void saveCostLedger(String projectKey, String sessionId, CostLedger ledger) {
+        if (sessionId == null || ledger == null || ledger.isEmpty()) {
+            return;
+        }
+        Path file = costFile(projectKey, sessionId);
+        try {
+            Files.createDirectories(file.getParent());
+            String json = MAPPER.writerWithDefaultPrettyPrinter().writeValueAsString(ledger.toSnapshot());
+            Files.writeString(file, json, StandardCharsets.UTF_8);
+        } catch (IOException e) {
+            log.warn("save cost ledger failed: session={}, err={}", sessionId, e.getMessage());
+        }
+    }
+
+    /** 读回会话成本账本；文件缺失 / 解析失败返回空账本（不抛错）。 */
+    public CostLedger loadCostLedger(String projectKey, String sessionId) {
+        Path file = costFile(projectKey, sessionId);
+        if (!Files.exists(file)) {
+            return new CostLedger();
+        }
+        try {
+            CostSnapshot snapshot = MAPPER.readValue(Files.readString(file, StandardCharsets.UTF_8),
+                    CostSnapshot.class);
+            return CostLedger.fromSnapshot(snapshot);
+        } catch (IOException e) {
+            log.warn("load cost ledger failed: session={}, err={}", sessionId, e.getMessage());
+            return new CostLedger();
+        }
+    }
+
+    /** 聚合当前项目全部会话的成本账本，merge 成一个总账本（/cost 历史维度）。 */
+    public CostLedger aggregateProjectCost(String projectKey) {
+        CostLedger total = new CostLedger();
+        Path dir = projectDir(projectKey);
+        if (!Files.isDirectory(dir)) {
+            return total;
+        }
+        try (DirectoryStream<Path> stream = Files.newDirectoryStream(dir, "*.cost.json")) {
+            for (Path path : stream) {
+                try {
+                    CostSnapshot snapshot = MAPPER.readValue(
+                            Files.readString(path, StandardCharsets.UTF_8), CostSnapshot.class);
+                    total.merge(CostLedger.fromSnapshot(snapshot));
+                } catch (Exception e) {
+                    log.warn("skip malformed cost file {}: {}", path.getFileName(), e.getMessage());
+                }
+            }
+        } catch (IOException e) {
+            log.warn("aggregate project cost failed: {}", e.getMessage());
+        }
+        return total;
+    }
+
     /** 列出当前项目的全部会话，按最后活跃时间倒序。 */
     public List<SessionMeta> listSessions(String projectKey) {
         Path dir = projectDir(projectKey);
@@ -180,6 +241,10 @@ public class SessionStore {
 
     private Path sessionFile(String projectKey, String sessionId) {
         return projectDir(projectKey).resolve(sessionId + ".jsonl");
+    }
+
+    private Path costFile(String projectKey, String sessionId) {
+        return projectDir(projectKey).resolve(sessionId + ".cost.json");
     }
 
     private Path projectDir(String projectKey) {

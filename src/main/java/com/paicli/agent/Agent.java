@@ -238,7 +238,8 @@ public class Agent {
                     return "⏹️ 已取消当前任务。";
                 }
 
-                budget.recordTokens(response.inputTokens(), response.outputTokens(), response.cachedInputTokens());
+                budget.recordTokens(response.inputTokens(), response.outputTokens(),
+                        response.cachedInputTokens(), response.cacheCreationInputTokens());
                 pushStatus(budget, startNanos, "running");
 
                 // 截断续写：finish_reason=length 表示这次输出被长度上限切断，content 是半句话。
@@ -334,6 +335,8 @@ public class Agent {
 
                 // 记录 token 使用
                 memoryManager.recordTokenUsage(budget.totalInputTokens(), budget.totalOutputTokens(), budget.totalCachedInputTokens());
+                // 并入会话级成本账本（per-model + cache_read/cache_creation），供 /cost 与跨会话持久化。
+                memoryManager.mergeCostLedger(budget.costLedger());
                 pushStatus(budget, startNanos, "idle");
                 log.info("ReAct run finished: inputTokens={}, outputTokens={}, reasoningChars={}, answerChars={}",
                         budget.totalInputTokens(),

@@ -28,6 +28,7 @@ final class CliCommandParser {
         SEARCH_CODE,
         GRAPH_QUERY,
         CONTEXT_STATUS,
+        COST_STATUS,
         POLICY_STATUS,
         AUDIT_TAIL,
         SNAPSHOT,
@@ -210,6 +211,10 @@ final class CliCommandParser {
 
         if (trimmed.equalsIgnoreCase("/context") || trimmed.equalsIgnoreCase("/ctx")) {
             return new ParsedCommand(CommandType.CONTEXT_STATUS, null);
+        }
+
+        if (trimmed.equalsIgnoreCase("/cost")) {
+            return new ParsedCommand(CommandType.COST_STATUS, null);
         }
 
         if (trimmed.equalsIgnoreCase("/policy")) {
