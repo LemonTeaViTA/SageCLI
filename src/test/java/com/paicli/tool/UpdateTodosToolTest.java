@@ -114,4 +114,27 @@ class UpdateTodosToolTest {
         String result = registry.executeTool("update_todos", "{\"todos\":{\"foo\":\"bar\"}}");
         assertTrue(result.contains("必须是数组"), "应拒绝非数组: " + result);
     }
+
+    @Test
+    void shouldRejectZeroInProgressWhenWorkRemains() {
+        ToolRegistry registry = new ToolRegistry();
+        // 还有 pending 却没有任何 in_progress → 清单停摆，应被拒（恰好一个在做）。
+        String json = "{\"todos\":[" +
+                "{\"content\":\"A\",\"activeForm\":\"做A\",\"status\":\"completed\"}," +
+                "{\"content\":\"B\",\"activeForm\":\"做B\",\"status\":\"pending\"}]}";
+        String result = registry.executeTool("update_todos", json);
+        assertTrue(result.contains("恰好有一个 in_progress"), "应拒绝 0 个 in_progress: " + result);
+        assertTrue(registry.getTodos().isEmpty(), "校验失败时不应写入状态");
+    }
+
+    @Test
+    void shouldAllowZeroInProgressWhenAllCompleted() {
+        ToolRegistry registry = new ToolRegistry();
+        // 全部 completed 是合法收尾态：0 个 in_progress 不应被下界约束拦截（应走清空逻辑）。
+        String json = "{\"todos\":[" +
+                "{\"content\":\"A\",\"activeForm\":\"做A\",\"status\":\"completed\"}]}";
+        String result = registry.executeTool("update_todos", json);
+        assertFalse(result.contains("恰好有一个 in_progress"), "全完成不应触发下界约束: " + result);
+        assertTrue(registry.getTodos().isEmpty(), "全部完成后清单应清空");
+    }
 }

@@ -36,15 +36,31 @@ public class ConversationHistoryCompactor {
     private static final int DEFAULT_RETAIN_RECENT_ROUNDS = 3;
     private static final int MAX_SUMMARY_INPUT_CHARS = 60_000;
 
+    // 结构化摘要 prompt（对照 CC 的"防漂移"设计）：松散摘要会丢任务边界，导致压缩后跑偏。
+    // 两条关键约束：① 所有用户消息逐条保留（用户的每次诉求都是任务边界，不能合并/省略）；
+    // ② "下一步"必须附最近对话的原话引用（让续写锚定在真实上下文，而非摘要的二手转述）。
     private static final String SUMMARY_PROMPT = """
-            请把下面的对话历史压缩成简明摘要，保留：
-            1. 用户提出的关键诉求与目标
-            2. Agent 已经完成的关键操作（哪些工具调用了什么、返回了什么核心结果）
-            3. 已经达成的共识或结论
-            4. 仍未解决的问题或待办
+            请把下面的对话历史压缩成结构化摘要，严格按以下分节输出（缺失的节写"无"）：
 
-            不要复述每条原文，不要列举所有工具调用，不要保留无关闲聊。
-            输出 1-3 段中文，不要用列表，不要加任何前缀或元描述。
+            ## 用户诉求（逐条保留，不要合并）
+            按时间顺序列出用户提出的每一条诉求/指令的原意。用户的每次发言都是一个任务边界，
+            即使后来被推翻也要保留，并标注"（已撤销/已变更）"。绝不省略任何一条用户消息。
+
+            ## 已完成的关键操作
+            Agent 做了哪些关键动作（用了什么工具、改了哪些文件、得到什么核心结果）。
+            只记结论性事实，不复述工具原始输出。
+
+            ## 已达成的共识与结论
+            双方确认过的决定、约定的方案、排除掉的方向。
+
+            ## 仍未解决 / 待办
+            还没做完或还没确认的事项。
+
+            ## 下一步
+            紧接着应该做什么。这一节**必须引用最近几轮对话里的原话**（用引号标出关键句），
+            让后续工作锚定在真实上下文上，不要凭摘要自由发挥。
+
+            输出中文。除上述分节标题外不要加任何前缀、元描述或解释。
 
             === 待压缩的对话 ===
             %s
@@ -156,7 +172,7 @@ public class ConversationHistoryCompactor {
         }
         String prompt = String.format(SUMMARY_PROMPT, sb.toString());
         List<LlmClient.Message> req = List.of(
-                LlmClient.Message.system("你是一个对话摘要助手，只输出摘要本身，不输出元描述。"),
+                LlmClient.Message.system("你是一个对话摘要助手，按用户给定的分节结构输出摘要，只输出摘要本身，不输出任何元描述。"),
                 LlmClient.Message.user(prompt)
         );
         LlmClient.ChatResponse response = llmClient.chat(req, null);

@@ -867,9 +867,17 @@ public class ToolRegistry {
         boolean usedRipgrep = false;
         // 优先用系统 ripgrep（快几个数量级）；不可用或失败时回退到下面的 Java 遍历。
         if (isRipgrepAvailable()) {
-            List<GrepMatch> rg = ripgrepGrep(root, projectRoot, query, args.get("glob"),
-                    regex, caseSensitive, contextLines, maxResults);
-            if (rg != null) {  // null = rg 失败/超时，需回退；空 list = rg 成功但无匹配
+            List<GrepMatch> rg;
+            try {
+                rg = ripgrepGrep(root, projectRoot, query, args.get("glob"),
+                        regex, caseSensitive, contextLines, maxResults);
+            } catch (GrepTimeoutException te) {
+                // rg 在时限内没搜完：绝不静默返回部分结果（"没搜完"会被模型当成"没有"，导致走错方向）。
+                // 也不回退 Java 遍历——它更慢、同样会卡。直接抛错把决策权交回模型：缩小范围再搜。
+                return "代码搜索超时: 模式 \"" + query + "\" 在时限内未搜完，结果不完整未返回。\n"
+                        + "请缩小搜索范围（用 path 限定子目录、用 glob 限定文件类型），或换更精确的 pattern 再试。";
+            }
+            if (rg != null) {  // null = rg 失败，需回退；空 list = rg 成功但无匹配
                 matches = rg;
                 usedRipgrep = true;
             }
@@ -1009,16 +1017,46 @@ public class ToolRegistry {
             pb.directory(projectRoot.toFile());
             pb.redirectErrorStream(true);
             process = pb.start();
+
+            // 看门狗给"读取 + 进程退出"整体设时限。
+            // 关键：parseRipgrepJson 的 readLine 会一直阻塞到 EOF 或达上限——若 rg 中途卡住
+            // （超大文件 / 慢 IO），仅靠后置的 waitFor 永远触发不到。看门狗到点强杀进程，
+            // readLine 随之收到 EOF 解除阻塞，再由 timedOut 标志区分"真超时"与"正常读完"。
+            final Process p = process;
+            java.util.concurrent.atomic.AtomicBoolean timedOut = new java.util.concurrent.atomic.AtomicBoolean(false);
+            Thread watchdog = new Thread(() -> {
+                try {
+                    if (!p.waitFor(8, TimeUnit.SECONDS)) {
+                        timedOut.set(true);
+                        p.destroyForcibly();
+                    }
+                } catch (InterruptedException ignored) {
+                    Thread.currentThread().interrupt();
+                }
+            }, "grep-rg-watchdog");
+            watchdog.setDaemon(true);
+            watchdog.start();
+
             List<GrepMatch> matches;
             try (BufferedReader reader = new BufferedReader(
                     new InputStreamReader(process.getInputStream(), StandardCharsets.UTF_8))) {
                 matches = parseRipgrepJson(reader, maxResults);
             }
-            boolean finished = process.waitFor(8, TimeUnit.SECONDS);
-            if (!finished) {
+            watchdog.interrupt();  // 已读完，停掉看门狗，避免它在 8s 后误杀/误报
+
+            // 达上限是合法的提前停读：我们主动不再读，rg 仍在写管道导致进程未退出，属正常，需收尾杀掉。
+            // 只有"没达上限却被看门狗强杀"才是真超时——此时流被中途截断，结果不完整。
+            if (matches.size() >= maxResults) {
                 process.destroyForcibly();
+            } else if (timedOut.get()) {
+                throw new GrepTimeoutException();
             }
             return matches;
+        } catch (GrepTimeoutException te) {
+            if (process != null) {
+                process.destroyForcibly();
+            }
+            throw te;  // 透传给 grepCode，由其返回"搜索未完成"错误，区别于"无匹配"
         } catch (Exception e) {
             if (process != null) {
                 process.destroyForcibly();
@@ -1028,6 +1066,10 @@ public class ToolRegistry {
             }
             return null;  // 任何问题都回退 Java 遍历
         }
+    }
+
+    /** ripgrep 在时限内未搜完（结果不完整）的信号。区别于"搜完了但无匹配"——后者返回空 list。 */
+    private static final class GrepTimeoutException extends RuntimeException {
     }
 
     /**
@@ -2058,6 +2100,7 @@ public class ToolRegistry {
                 return "update_todos 失败：todos 必须是数组，每项为 {content, activeForm, status}。";
             }
             int inProgress = 0;
+            int pending = 0;
             for (JsonNode node : arr) {
                 String content = node.path("content").asText("").trim();
                 String activeForm = node.path("activeForm").asText("").trim();
@@ -2070,12 +2113,20 @@ public class ToolRegistry {
                 }
                 if (status.equals("in_progress")) {
                     inProgress++;
+                } else if (status.equals("pending")) {
+                    pending++;
                 }
                 // activeForm 缺省时用 content 兜底，避免渲染空白。
                 parsed.add(new TodoItem(content, activeForm.isEmpty() ? content : activeForm, status));
             }
             if (inProgress > 1) {
                 return "update_todos 失败：任意时刻只允许一个 in_progress，收到 " + inProgress + " 个。请只把当前正在做的那一步标为 in_progress。";
+            }
+            // 下界：还有未完成任务却没有任何 in_progress，说明清单"停摆"（学自 CC：恰好一个在做）。
+            // 例外：全部 completed 是合法的收尾态（下面会触发 allDone 清空），不强制。
+            if (inProgress == 0 && pending > 0) {
+                return "update_todos 失败：还有未完成任务时必须恰好有一个 in_progress（不能 0 个）。"
+                        + "请把你接下来要做的那一步标为 in_progress；若全部做完请把它们都标为 completed。";
             }
         } catch (Exception e) {
             return "update_todos 失败：todos 解析错误：" + e.getMessage();

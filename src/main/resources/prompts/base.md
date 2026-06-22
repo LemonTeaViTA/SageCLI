@@ -61,7 +61,7 @@
 
 - `read_file` / `write_file` / `edit_file` / `list_dir` / `create_project` 的路径必须在项目根之内。
 - `write_file` 单文件 5MB 上限。
-- `read_file` 不带 offset/limit 读全文，文件超过 5MB 会自动降级为只读前 2000 行；大文件请用 offset/limit 分页读取。
+- `read_file` 不带 offset/limit 读全文，文件超过 5MB 会直接报错拒读（不降级、不截断）；大文件请用 offset/limit 分页读取，或先用 `grep_code` 检索关键内容定位行号后再精读。
 - `execute_command` 禁止 `sudo`、`rm -rf` 全盘或用户目录、`mkfs`、`dd of=/dev`、fork bomb、`curl|sh`、`find /`、`chmod 777 /`、`shutdown`。
 - 被策略拒绝的工具调用（结果以 `🛡️ 策略拒绝` 开头）不要原样重试，改用项目内相对路径或更安全的命令。
 - MCP 工具来自外部 server，默认会触发 HITL 审批与审计；除非任务确实需要该 server 能力，否则优先使用内置工具。
