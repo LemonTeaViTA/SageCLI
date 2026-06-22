@@ -419,6 +419,57 @@ class ToolRegistryTest {
     }
 
     @Test
+    void grepFilesWithMatchesModeReturnsOnlyFileNames(@TempDir Path tempDir) throws Exception {
+        Files.createDirectories(tempDir.resolve("src"));
+        Files.writeString(tempDir.resolve("src/A.java"), "class A { String x = \"needle\"; void y(){ int needle = 1; } }\n");
+        Files.writeString(tempDir.resolve("src/B.java"), "class B { String x = \"needle\"; }\n");
+        ToolRegistry registry = new ToolRegistry();
+        registry.setProjectPath(tempDir.toString());
+
+        String result = registry.executeTool("grep_code",
+                "{\"pattern\":\"needle\",\"output_mode\":\"files_with_matches\"}");
+
+        assertTrue(result.contains("命中文件"), "应回文件计数标题: " + result);
+        assertTrue(result.contains("src/A.java"), "应含 A.java: " + result);
+        assertTrue(result.contains("src/B.java"), "应含 B.java: " + result);
+        // files_with_matches 不应带行号/内容（A.java 里有两处 needle，文件名只出现一次）。
+        assertFalse(result.contains("src/A.java:"), "文件名模式不应带行号: " + result);
+        int firstA = result.indexOf("src/A.java");
+        assertEquals(result.lastIndexOf("src/A.java"), firstA, "同一文件名应只出现一次: " + result);
+    }
+
+    @Test
+    void grepCountModeReturnsPerFileCounts(@TempDir Path tempDir) throws Exception {
+        Files.createDirectories(tempDir.resolve("src"));
+        // A.java 两处命中，B.java 一处命中。
+        Files.writeString(tempDir.resolve("src/A.java"), "needle one\nneedle two\nother\n");
+        Files.writeString(tempDir.resolve("src/B.java"), "needle only\n");
+        ToolRegistry registry = new ToolRegistry();
+        registry.setProjectPath(tempDir.toString());
+
+        String result = registry.executeTool("grep_code",
+                "{\"pattern\":\"needle\",\"output_mode\":\"count\"}");
+
+        assertTrue(result.contains("命中 3 条"), "总命中应为 3: " + result);
+        assertTrue(result.contains("2\t") && result.contains("src/A.java"), "A.java 应计 2: " + result);
+        assertTrue(result.contains("1\t") && result.contains("src/B.java"), "B.java 应计 1: " + result);
+    }
+
+    @Test
+    void grepInvalidOutputModeFallsBackToContent(@TempDir Path tempDir) throws Exception {
+        Files.createDirectories(tempDir.resolve("src"));
+        Files.writeString(tempDir.resolve("src/A.java"), "class A { String x = \"needle\"; }\n");
+        ToolRegistry registry = new ToolRegistry();
+        registry.setProjectPath(tempDir.toString());
+
+        String result = registry.executeTool("grep_code",
+                "{\"pattern\":\"needle\",\"output_mode\":\"bogus\"}");
+
+        // 非法 mode 回退 content：带行号的命中内容。
+        assertTrue(result.contains("src/A.java:1"), "非法 mode 应回退 content（带行号）: " + result);
+    }
+
+    @Test
     void shouldTimeoutLongRunningCommandWithoutHanging(@TempDir Path tempDir) {
         ToolRegistry registry = new ToolRegistry(1);
         registry.setProjectPath(tempDir.toString());

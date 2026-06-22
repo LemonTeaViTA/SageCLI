@@ -36,6 +36,13 @@ public class ConversationHistoryCompactor {
     private static final int DEFAULT_RETAIN_RECENT_ROUNDS = 3;
     private static final int MAX_SUMMARY_INPUT_CHARS = 60_000;
 
+    // 第一档"清旧工具结果正文"保留的最近工具结果条数。工具结果（read_file/grep/execute_command 等）
+    // 正文最占 token，且越老越无关；最近 N 条留全，更老的换占位符。对标 CC 的"清空旧工具结果正文"。
+    private static final int DEFAULT_RETAIN_RECENT_TOOL_RESULTS = 5;
+    // 占位符：替换被清理的工具结果正文。保留 tool_call_id 配对不动，只换 content。
+    private static final String CLEARED_TOOL_RESULT_PLACEHOLDER =
+            "[旧工具结果正文已清除以节省上下文；如仍需要请重新调用对应工具]";
+
     // 结构化摘要 prompt（对照 CC 的"防漂移"设计）：松散摘要会丢任务边界，导致压缩后跑偏。
     // 两条关键约束：① 所有用户消息逐条保留（用户的每次诉求都是任务边界，不能合并/省略）；
     // ② "下一步"必须附最近对话的原话引用（让续写锚定在真实上下文，而非摘要的二手转述）。
@@ -95,6 +102,59 @@ public class ConversationHistoryCompactor {
         int currentTokens = TokenBudget.estimateMessagesTokens(history);
         if (currentTokens < triggerTokens) return false;
 
+        // 第一档（便宜、无损语义、不调 LLM）：清掉较老的工具结果正文，只留最近 N 条。
+        // 工具结果正文最占 token 且越老越无关；先腾这一块，常常就够，避免昂贵的整段 LLM 摘要。
+        boolean clearedAny = clearOldToolResultBodies(history, DEFAULT_RETAIN_RECENT_TOOL_RESULTS);
+        if (clearedAny) {
+            int afterClear = TokenBudget.estimateMessagesTokens(history);
+            log.info("tier-1 cleared old tool result bodies: tokens {} -> {}", currentTokens, afterClear);
+            if (afterClear < triggerTokens) {
+                return true;  // 第一档已腾够，不必动用 LLM 摘要
+            }
+            currentTokens = afterClear;  // 仍超阈值，带着新基线进入第二档
+        }
+
+        // 第二档（昂贵、调 LLM）：把早期对话整段摘要。
+        // 注意：即便第二档因 user 轮次不足等原因没跑成，只要第一档清理过就是真实进展，应返回 true。
+        boolean summarized = summarizeOldHistory(history, triggerTokens, currentTokens);
+        return summarized || clearedAny;
+    }
+
+    /**
+     * 第一档：把"较老的"工具结果消息（role=tool）正文换成占位符，保留最近 retainRecent 条不动。
+     * 只改 content，tool_call_id 配对与 assistant 侧 tool_calls 全保持原样，不破坏协议。
+     *
+     * @return 是否清理了至少一条（决定要不要重估 token）
+     */
+    boolean clearOldToolResultBodies(List<LlmClient.Message> history, int retainRecent) {
+        // 先找出所有 role=tool 且正文尚未被清除的消息索引。
+        List<Integer> toolIndices = new ArrayList<>();
+        for (int i = 0; i < history.size(); i++) {
+            LlmClient.Message m = history.get(i);
+            if ("tool".equals(m.role())
+                    && m.content() != null
+                    && !m.content().isEmpty()
+                    && !CLEARED_TOOL_RESULT_PLACEHOLDER.equals(m.content())) {
+                toolIndices.add(i);
+            }
+        }
+        if (toolIndices.size() <= retainRecent) {
+            return false;  // 工具结果还不够多，清了也省不下，留着
+        }
+        // 保留最近 retainRecent 条，清除更早的。
+        int clearUpTo = toolIndices.size() - retainRecent;
+        boolean cleared = false;
+        for (int k = 0; k < clearUpTo; k++) {
+            int idx = toolIndices.get(k);
+            LlmClient.Message old = history.get(idx);
+            history.set(idx, LlmClient.Message.tool(old.toolCallId(), CLEARED_TOOL_RESULT_PLACEHOLDER));
+            cleared = true;
+        }
+        return cleared;
+    }
+
+    /** 第二档：整段 LLM 摘要（原 compactIfNeeded 主体）。 */
+    private boolean summarizeOldHistory(List<LlmClient.Message> history, int triggerTokens, int currentTokens) {
         int systemEnd = "system".equals(history.get(0).role()) ? 1 : 0;
 
         List<Integer> userIndices = new ArrayList<>();

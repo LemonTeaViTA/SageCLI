@@ -408,15 +408,18 @@ public class ToolRegistry {
 
         tools.put("grep_code", new Tool(
                 "grep_code",
-                "在项目内按关键字或正则实时搜索代码（只读、返回文件和行号）；适合精确符号/字符串定位，找到后再 read_file 读取上下文",
+                "在项目内按关键字或正则实时搜索代码（只读、返回文件和行号）；适合精确符号/字符串定位，找到后再 read_file 读取上下文。"
+                        + "output_mode 控制返回粒度：files_with_matches 只回文件名（最省 token，先用它定位文件）、count 回每文件命中数、content 回带行号的命中内容（默认）。",
                 createParameters(
                         new Param("pattern", "string", "要搜索的关键字或正则", true),
                         new Param("path", "string", "搜索起始目录，默认 .", false),
                         new Param("glob", "string", "可选文件 glob 过滤，例如 **/*.java", false),
                         new Param("regex", "boolean", "是否按 Java 正则解释 pattern，默认 false 表示字面量搜索", false),
                         new Param("case_sensitive", "boolean", "是否大小写敏感，默认 true", false),
-                        new Param("context_lines", "integer", "每条命中前后上下文行数，默认 0，上限 5", false),
-                        new Param("max_results", "integer", "最多返回命中数，默认 50，上限 200", false)
+                        new Param("context_lines", "integer", "每条命中前后上下文行数，默认 0，上限 5（仅 content 模式有效）", false),
+                        new Param("max_results", "integer", "最多返回命中数，默认 50，上限 200", false),
+                        new Param("output_mode", "string",
+                                "返回粒度：files_with_matches（只回文件名，最省 token）/ count（每文件命中数）/ content（带行号内容，默认）", false)
                 ),
                 args -> grepCode(args)
         ));
@@ -848,6 +851,7 @@ public class ToolRegistry {
         int contextLines = clamp(parseInt(args.get("context_lines"), 0), 0, MAX_GREP_CONTEXT_LINES);
         boolean regex = parseBoolean(args.get("regex"), false);
         boolean caseSensitive = parseBoolean(args.get("case_sensitive"), true);
+        String outputMode = normalizeGrepOutputMode(args.get("output_mode"));
         PathMatcher globMatcher = null;
         PathMatcher fileNameGlobMatcher = null;
         if (args.get("glob") != null && !args.get("glob").isBlank()) {
@@ -910,6 +914,46 @@ public class ToolRegistry {
         }
         // 按文件修改时间降序排（最近改的最相关）。同文件多条命中 mtime 相同，稳定排序保持其分组与行序。
         sortByMtimeDesc(matches, m -> projectRoot.resolve(m.file()));
+
+        // files_with_matches：只回去重后的文件名（保 mtime 序），最省 token，供模型先粗定位文件。
+        if ("files_with_matches".equals(outputMode)) {
+            List<String> files = new ArrayList<>();
+            for (GrepMatch m : matches) {
+                if (!files.contains(m.file())) {
+                    files.add(m.file());
+                }
+            }
+            StringBuilder fb = new StringBuilder();
+            fb.append("命中文件 ").append(files.size()).append(" 个");
+            if (matches.size() >= maxResults) {
+                fb.append("（命中数已达上限 ").append(maxResults).append("，文件数可能不全）");
+            }
+            fb.append(":\n");
+            for (String f : files) {
+                fb.append(f).append("\n");
+            }
+            return fb.toString().trim();
+        }
+
+        // count：每文件命中数（按 mtime 序，不重排成数量序，保持"最近改的在前"）。
+        if ("count".equals(outputMode)) {
+            java.util.LinkedHashMap<String, Integer> counts = new java.util.LinkedHashMap<>();
+            for (GrepMatch m : matches) {
+                counts.merge(m.file(), 1, Integer::sum);
+            }
+            StringBuilder cb = new StringBuilder();
+            cb.append("命中 ").append(matches.size()).append(" 条，分布于 ").append(counts.size()).append(" 个文件");
+            if (matches.size() >= maxResults) {
+                cb.append("（已达上限 ").append(maxResults).append("）");
+            }
+            cb.append(":\n");
+            for (Map.Entry<String, Integer> e : counts.entrySet()) {
+                cb.append(e.getValue()).append("\t").append(e.getKey()).append("\n");
+            }
+            return cb.toString().trim();
+        }
+
+        // content（默认）：带行号与上下文的命中内容。
         StringBuilder sb = new StringBuilder();
         sb.append("匹配结果 ").append(matches.size()).append(" 条");
         if (matches.size() >= maxResults) {
@@ -925,6 +969,21 @@ public class ToolRegistry {
             }
         }
         return sb.toString().trim();
+    }
+
+    /** 归一化 grep output_mode：仅接受 files_with_matches / count，其余（含 null、非法值）一律回 content。 */
+    private static String normalizeGrepOutputMode(String raw) {
+        if (raw == null) {
+            return "content";
+        }
+        String v = raw.trim().toLowerCase(java.util.Locale.ROOT);
+        if (v.equals("files_with_matches") || v.equals("files") || v.equals("l")) {
+            return "files_with_matches";
+        }
+        if (v.equals("count") || v.equals("c")) {
+            return "count";
+        }
+        return "content";
     }
 
     private void collectMatches(Path file, Path relative, Pattern contentPattern, int contextLines,

@@ -155,6 +155,53 @@ class ConversationHistoryCompactorTest {
         assertEquals(before, history.size());
     }
 
+    @Test
+    void tier1ClearsOldToolResultsWithoutCallingLlm() {
+        // 多条大工具结果 + 超阈值：第一档应清掉较老的工具结果正文，腾够空间后不调 LLM 摘要。
+        StubCompactor c = new StubCompactor("SHOULD NOT BE CALLED", 3);
+        List<LlmClient.Message> history = new ArrayList<>();
+        history.add(LlmClient.Message.system("S"));
+        history.add(LlmClient.Message.user("Q"));
+        // 8 条工具结果，每条 ~8KB 正文；retain 最近 5 条，应清掉最老 3 条。
+        for (int i = 0; i < 8; i++) {
+            history.add(LlmClient.Message.assistant(null, null,
+                    List.of(new LlmClient.ToolCall("c" + i,
+                            new LlmClient.ToolCall.Function("read_file", "{}")))));
+            history.add(new LlmClient.Message("tool", longText(8_000), null, null, "c" + i));
+        }
+
+        boolean compacted = c.compactIfNeeded(history, 5_000);
+
+        assertTrue(compacted, "应发生压缩");
+        assertEquals(0, c.summarizeCalls.get(), "第一档腾够后不应调用 LLM 摘要");
+        // 最老的工具结果正文应被占位符替换；最近的仍保留原文。
+        long cleared = history.stream()
+                .filter(m -> "tool".equals(m.role()) && m.content().contains("已清除"))
+                .count();
+        assertEquals(3, cleared, "应清掉最老 3 条工具结果（共 8 条，留最近 5 条）");
+        // 配对不破：被清的 tool 消息仍带原 tool_call_id。
+        assertTrue(history.stream().anyMatch(m -> "tool".equals(m.role())
+                && m.content().contains("已清除") && "c0".equals(m.toolCallId())));
+    }
+
+    @Test
+    void tier1FallsThroughToLlmWhenStillOverTrigger() {
+        // 清完旧工具结果仍超阈值：应继续走第二档 LLM 摘要。
+        StubCompactor c = new StubCompactor("MOCK SUMMARY", 2);
+        List<LlmClient.Message> history = new ArrayList<>();
+        history.add(LlmClient.Message.system("S"));
+        // 大量 user/assistant 文本（非工具结果），第一档清不动，必然落到第二档。
+        for (int i = 0; i < 6; i++) {
+            history.add(LlmClient.Message.user("Q" + i + ": " + longText(5_000)));
+            history.add(LlmClient.Message.assistant("A" + i + ": " + longText(5_000)));
+        }
+
+        boolean compacted = c.compactIfNeeded(history, 100);
+
+        assertTrue(compacted);
+        assertEquals(1, c.summarizeCalls.get(), "第一档无可清理时应落到 LLM 摘要");
+    }
+
     private static String longText(int chars) {
         StringBuilder sb = new StringBuilder(chars);
         for (int i = 0; i < chars; i++) sb.append('x');
